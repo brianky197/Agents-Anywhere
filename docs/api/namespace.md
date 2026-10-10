@@ -57,6 +57,7 @@ Do not store `/api/v2` in `serverUrl`.
 
 - `POST /api/v2/connector/auth`
 - `POST /api/v2/connector/ingest`
+- `POST /api/v2/connector/timeline/manifest`
 - `WS /api/v2/connector/ws`
 - `GET /api/v2/connector/sessions/{session_id}/attachments/{file_id}/content`
 - `PUT /api/v2/connector/fs/transfers/{transfer_id}`

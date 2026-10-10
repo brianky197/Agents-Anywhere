@@ -185,6 +185,7 @@ Stable connector HTTP endpoints:
 ```text
 POST /api/v2/connector/auth
 POST /api/v2/connector/ingest
+POST /api/v2/connector/timeline/manifest
 ```
 
 These endpoint names should not change as part of the runtime protocol refactor.
@@ -270,12 +271,68 @@ protocol violations that are intentionally unsupported may still return HTTP
 400; unexpected processing failures should be logged and reported through
 `rejected` instead of surfacing as HTTP 500.
 
+### Reconciling complete snapshots
+
+A `timeline.sync` with `complete: true` replaces the session's whole timeline,
+so it has to travel as one request, and a large session exceeds the ingress
+body limit (HTTP 413, issue #278). Splitting it does not help: a later complete
+page would delete the earlier ones. Instead, the Connector compares the
+snapshot with what the Server stores and sends appends and deletes, each of
+which is an ordinary bounded request.
+
+```text
+POST /api/v2/connector/timeline/manifest
+{ "sessionId", "externalSessionId"?, "runtime", "runtimeId", "after"?, "limit"? }
+-> { "items": [{ "id", "orderSeq", "contentHash" }], "next": { "orderSeq", "id" } | null }
+```
+
+- The manifest pages the stored items in `(orderSeq, id)` order, up to `limit`
+  (default 1000, at most 5000) per page. Pass `next` back as `after` until it is
+  null. The session is resolved like `timeline.sync` resolves it, using
+  `externalSessionId` where the sync would use the first item's
+  `source.sessionId`. A session the Server does not have yet has an empty
+  manifest. It requires the Connector access token; an unconfigured runtime
+  answers 409 `runtime_not_configured`.
+- `timeline.sync` with `complete: false` and `orderAuthoritative: true` stores
+  each item's `orderSeq` as given, also for existing items. An item whose order
+  or `contentHash` differs is written; others are unchanged. Moving an existing
+  item, or inserting one at or below the current last `orderSeq`, is a reset:
+  session subscribers get `session.refetch_required`, and event recovery from
+  before it reports `snapshotRequired`. Appending after the end publishes
+  ordinary item events.
+- `timeline.delete { sessionId, runtime, runtimeId, externalSessionId?, itemIds }`
+  deletes up to 10000 item IDs. Unknown IDs are ignored, so a repeated delete
+  changes nothing. A delete that removes anything is a reset, like above. A
+  malformed `itemIds` list returns HTTP 400 `invalid_timeline_delete`.
+
+The Connector sends one incremental `timeline.sync` with `orderAuthoritative`
+holding only the items whose `(orderSeq, contentHash)` differ from the
+manifest (paged like any other incremental sync), then `timeline.delete` for
+the manifest IDs the snapshot no longer has. It deletes only IDs it read from
+the manifest, so items stored after the read are kept. When nothing differs it
+still sends one unchanged item, which the Server skips but uses to resolve the
+session, so source observation time keeps moving. The end state is the same as
+a replacing snapshot, but unchanged history is never uploaded again and no
+request has to hold the whole session.
+
+A Server without the manifest answers 404. The Connector then sends complete
+snapshots whole, as before, and asks again after 10 minutes. Other manifest
+refusals send that snapshot whole; 408, 429 and 5xx are retried later. Old
+Connectors keep sending complete snapshots, which the Server still applies as
+replacements.
+
+The DSH relay reads the manifest when the first page of a capture arrives,
+uploads each page's changed items before acknowledging it, and sends the
+deletes with the commit, so the commit acknowledgement does not wait for the
+history.
+
 The target semantic connector notification methods are:
 
 ```text
 session.meta.upsert
 timeline.sync
 timeline.itemUpsert
+timeline.delete
 runtime.state.updated
 runtime.notice.snapshot
 runtime.notice.updated

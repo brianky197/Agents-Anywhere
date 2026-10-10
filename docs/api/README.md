@@ -32,6 +32,7 @@ All product endpoints are mounted under `/api/v2`.
 /pairing/*
 /connector/auth
 /connector/ingest
+/connector/timeline/manifest
 /connector/ws
 ```
 

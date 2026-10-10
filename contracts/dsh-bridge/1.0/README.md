@@ -105,11 +105,25 @@ The handshake advertises `features.syncMode = events` and `projectionVersion = 3
 `sync-batch.schema.json`, with monotonic `batchSeq`. The Connector acknowledges each
 batch via `runtime.sync.ack {streamId,batchSeq}` before the next batch is sent.
 
-`snapshot.begin/items/commit` captures one visible session. Pages are staged only
+`snapshot.begin/items/commit` captures one visible session. Pages are assembled
 in the Connector; after count and identity checks it forwards existing backend
 `session.meta.upsert` and `timeline.sync {complete:true}` notifications. Abort or
 incomplete transport never submits a partial replacement. Turn lifecycle markers
 are excluded from backend Timeline contents.
+
+With a backend that serves the timeline manifest (issue #278, see
+`docs/api/realtime.md`), the Connector reconciles the capture instead of
+replacing the timeline in one request. On the first `snapshot.items` page it
+reads the stored manifest and sends `session.meta.upsert`; every page then
+uploads only its items whose order or content hash differ, before that page is
+acknowledged; the commit sends `session.meta.upsert` and `timeline.delete` for
+stored items the capture does not have. No request holds the whole history, and
+the commit acknowledgement waits only for those small requests. Items uploaded
+before an abort stay, since they are current items of the session; nothing is
+deleted and no checkpoint is saved until a commit. If the backend has no
+manifest or refuses a page, the commit sends the spooled capture as one complete
+`timeline.sync`, which the ingest client reconciles again when it can. The
+bridge protocol is unchanged.
 
 `notifications` carries already normalized platform notifications. A Connector
 requests reliable recovery with `runtime.sync.subscribe {checkpointVersion:1}`;
@@ -120,7 +134,8 @@ the asynchronous notification/coalescing queue. Native changes are still batched
 at the Bridge's bounded cadence. Snapshot page ACK only means page receipt;
 snapshot.commit waits for ingestion of the assembled complete snapshot.
 
-If the backend refuses that snapshot (HTTP 413, another HTTP 4xx, or the
+If the backend still refuses that snapshot (HTTP 413 for a single item, or for
+the whole snapshot when the backend has no manifest; another HTTP 4xx; or the
 notification is rejected), the Connector still ACKs the commit so the feed moves
 on, and quarantines only that session: it reports the source as `unavailable`
 with reason `history_too_large` (413) or `history_rejected`, ignores
