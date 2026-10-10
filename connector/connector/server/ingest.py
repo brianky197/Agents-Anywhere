@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -17,6 +18,13 @@ from connector.server.ingest_batching import (
     iter_ingest_pages,
     next_ingest_page,
 )
+from connector.server.ingest_reconcile import (
+    MANIFEST_PAGE_ITEMS,
+    Manifest,
+    is_full_snapshot,
+    manifest_request,
+    reconcile_snapshot,
+)
 from connector.server.urls import api_v2_url
 
 # HTTP ingest owns explicit bulk sync and disconnected WebSocket fallback.
@@ -26,6 +34,9 @@ from connector.server.urls import api_v2_url
 # over the connector WebSocket.
 FLUSH_WINDOW_SECONDS = 0.02
 FLUSH_MAX = 64
+# A Server without the timeline manifest is asked again after this long, so an
+# upgraded Server is noticed without restarting the Connector.
+RECONCILE_RETRY_SECONDS = 10 * 60
 
 AccessTokenProvider = Callable[[bool], Awaitable[str]]
 HttpClientGetter = Callable[[], httpx.AsyncClient | None]
@@ -61,6 +72,7 @@ class ConnectorIngestClient:
         self._available = asyncio.Event()
         self._posting = False
         self._max_body_bytes = MAX_INGEST_BODY_BYTES
+        self._reconcile_disabled_until = 0.0
 
     @property
     def has_pending(self) -> bool:
@@ -176,6 +188,15 @@ class ConnectorIngestClient:
         owned = client is None
         if client is None:
             client = self._http_client_factory(60)
+        try:
+            # A complete snapshot becomes appends and deletes against the
+            # stored manifest (issue #278). The rewrite replaces it in
+            # ``pending``, so a retry after a transient failure resumes it.
+            await self._reconcile_snapshots(client, token, pending)
+        except BaseException:
+            if owned:
+                await client.aclose()
+            raise
         pages = iter_ingest_pages(pending, self._max_body_bytes)
         delivered = (0, 0)
         rejected: list[Exception] = []
@@ -213,6 +234,97 @@ class ConnectorIngestClient:
                 await client.aclose()
         if rejected:
             raise rejected[0]
+
+    def _reconcile_enabled(self) -> bool:
+        return time.monotonic() >= self._reconcile_disabled_until
+
+    async def read_timeline_manifest(self, params: dict[str, Any]) -> Manifest | None:
+        """The stored timeline of one session, or None without a manifest."""
+        if not self._reconcile_enabled():
+            return None
+        token = [await self._access_token_provider(False)]
+        client = self._http_client_getter()
+        owned = client is None
+        if client is None:
+            client = self._http_client_factory(60)
+        try:
+            return await self._read_manifest(client, token, params)
+        finally:
+            if owned:
+                await client.aclose()
+
+    async def _reconcile_snapshots(
+        self, client: httpx.AsyncClient, token: list[str], pending: list[dict[str, Any]],
+    ) -> None:
+        if not any(is_full_snapshot(notification) for notification in pending):
+            return
+        rewritten: list[dict[str, Any]] = []
+        for notification in pending:
+            manifest = None
+            if is_full_snapshot(notification) and self._reconcile_enabled():
+                manifest = await self._read_manifest(client, token, notification["params"])
+            if manifest is None:
+                rewritten.append(notification)
+            else:
+                rewritten.extend(await asyncio.to_thread(reconcile_snapshot, notification, manifest))
+        pending[:] = rewritten
+
+    async def _read_manifest(
+        self, client: httpx.AsyncClient, token: list[str], params: dict[str, Any],
+    ) -> Manifest | None:
+        """Read every manifest page; None means send the complete snapshot whole."""
+        body = manifest_request(params)
+        manifest: Manifest = {}
+        after = None
+        while True:
+            request = {**body, "limit": MANIFEST_PAGE_ITEMS, **({"after": after} if after else {})}
+            response = await self._post_json(client, token, "/connector/timeline/manifest", request)
+            status = getattr(response, "status_code", 200)
+            if status == 404:
+                # The Server predates the manifest: complete snapshots go whole.
+                self._disable_reconcile()
+                return None
+            if status in {408, 429} or status >= 500:
+                raise ConnectorNetworkError(f"backend manifest temporarily unavailable: HTTP {status}")
+            if status >= 400:
+                # For example an unconfigured runtime: the snapshot itself gets
+                # the same refusal as before.
+                logger.warning("timeline manifest refused HTTP {}; sending the snapshot whole", status)
+                return None
+            payload = _response_json(response)
+            entries = payload.get("items") if isinstance(payload, dict) else None
+            if not isinstance(entries, list):
+                self._disable_reconcile()
+                return None
+            for entry in entries:
+                if (isinstance(entry, dict) and isinstance(entry.get("id"), str)
+                        and type(entry.get("orderSeq")) is int and isinstance(entry.get("contentHash"), str)):
+                    manifest[entry["id"]] = (entry["orderSeq"], entry["contentHash"])
+            after = payload.get("next")
+            if not isinstance(after, dict):
+                return manifest
+
+    def _disable_reconcile(self) -> None:
+        if self._reconcile_enabled():
+            logger.warning("backend has no timeline manifest; sending complete snapshots whole")
+        self._reconcile_disabled_until = time.monotonic() + RECONCILE_RETRY_SECONDS
+
+    async def _post_json(
+        self, client: httpx.AsyncClient, token: list[str], path: str, payload: dict[str, Any],
+    ) -> httpx.Response:
+        url = api_v2_url(self._server_url, path)
+        try:
+            response = await client.post(url, headers={"Authorization": f"Bearer {token[0]}"},
+                                         json=payload, timeout=60)
+            if getattr(response, "status_code", None) == 401:
+                token[0] = await self._access_token_provider(True)
+                response = await client.post(url, headers={"Authorization": f"Bearer {token[0]}"},
+                                             json=payload, timeout=60)
+                if getattr(response, "status_code", None) == 401:
+                    raise ConnectorAuthenticationError("connector credential no longer valid")
+        except httpx.RequestError as exc:
+            raise ConnectorNetworkError(f"backend manifest request failed: {type(exc).__name__}") from exc
+        return response
 
     async def _post_page(self, client: httpx.AsyncClient, token: list[str], body: bytes) -> None:
         # Both an auth retry and an ambiguous network replay resend the exact
@@ -262,6 +374,16 @@ def _record_rejection(rejected: list[Exception], error: Exception, methods: str)
     # Methods only: the error text must not carry notification or server data.
     logger.warning("connector ingest notification rejected methods={} error={}", methods, error)
     rejected.append(error)
+
+
+def _response_json(response: httpx.Response) -> Any:
+    json_reader = getattr(response, "json", None)
+    if not callable(json_reader):
+        return None
+    try:
+        return json_reader()
+    except ValueError:
+        return None
 
 
 def _raise_for_rejected_notifications(response: httpx.Response) -> None:

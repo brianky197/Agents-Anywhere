@@ -8,6 +8,7 @@ from pathlib import Path
 
 import httpx
 import pytest
+from ingest_servers import old_server
 
 from connector.server.ingest import ConnectorIngestClient
 
@@ -43,7 +44,7 @@ def test_CE_413_001_incremental_unicode_pages_fit_and_preserve_data():
         def transport(request):
             bodies.append(request.content)
             return httpx.Response(200, json={"rejected": []})
-        async with httpx.AsyncClient(transport=httpx.MockTransport(transport)) as http:
+        async with httpx.AsyncClient(transport=old_server(transport)) as http:
             await client_for(http, fixture["budgetBytes"]).ingest_notifications([notification])
         assert len(bodies) > 1, "S1: original unbounded sender has only one oversized request"
         assert all(len(body) <= fixture["budgetBytes"] for body in bodies), "P1"
@@ -65,7 +66,7 @@ def test_S8_envelope_exact_budget_and_plus_one():
         def transport(request):
             bodies.append(request.content)
             return httpx.Response(200, json={"rejected": []})
-        async with httpx.AsyncClient(transport=httpx.MockTransport(transport)) as http:
+        async with httpx.AsyncClient(transport=old_server(transport)) as http:
             await client_for(http, len(encoded)).ingest_notifications([notification])
             assert bodies == [encoded]
             # Over the page budget an indivisible notification still travels
@@ -84,7 +85,7 @@ def test_S2_oversized_atomic_data_never_truncated_or_split(complete, rows):
             bodies.append(request.content)
             return httpx.Response(200, json={"rejected": []})
         notification = timeline(rows, complete=complete)
-        async with httpx.AsyncClient(transport=httpx.MockTransport(transport)) as http:
+        async with httpx.AsyncClient(transport=old_server(transport)) as http:
             await client_for(http).ingest_notifications([notification])
         assert len(bodies) == 1, "P3: an indivisible notification is never split"
         assert json.loads(bodies[0])["notifications"] == [notification]
@@ -100,7 +101,7 @@ def test_S2_server_413_for_atomic_data_is_typed_and_sanitized(complete, rows):
         def transport(request):
             bodies.append(request.content)
             return httpx.Response(413)
-        async with httpx.AsyncClient(transport=httpx.MockTransport(transport)) as http:
+        async with httpx.AsyncClient(transport=old_server(transport)) as http:
             with pytest.raises(ConnectorIngestSizeError) as error:
                 await client_for(http).ingest_notifications([timeline(rows, complete=complete)])
         assert len(bodies) == 1
@@ -117,7 +118,7 @@ def test_S6_small_replacement_and_empty_timeline_remain_unchanged():
         def transport(request):
             bodies.extend(json.loads(request.content)["notifications"])
             return httpx.Response(200, json={"rejected": []})
-        async with httpx.AsyncClient(transport=httpx.MockTransport(transport)) as http:
+        async with httpx.AsyncClient(transport=old_server(transport)) as http:
             await client_for(http, 1000).ingest_notifications(expected)
         assert bodies == expected
     asyncio.run(run())
@@ -133,7 +134,7 @@ def test_S7_mixed_notifications_preserve_order_and_coalescing():
             assert len(request.content) <= 900
             delivered.extend(json.loads(request.content)["notifications"])
             return httpx.Response(200, json={"rejected": []})
-        async with httpx.AsyncClient(transport=httpx.MockTransport(transport)) as http:
+        async with httpx.AsyncClient(transport=old_server(transport)) as http:
             await client_for(http).ingest_notifications(expected)
         assert delivered[0] == expected[0] and delivered[-1] == expected[-1]
         assert [i for n in delivered[1:-1] for i in n["params"]["items"]] == expected[1]["params"]["items"]
@@ -150,7 +151,7 @@ def test_S4_401_refreshes_identical_page_and_future_pages_use_fresh_token():
         def transport(request):
             requests.append((request.content, request.headers["Authorization"]))
             return httpx.Response(401 if len(requests) == 1 else 200, json={"rejected": []})
-        async with httpx.AsyncClient(transport=httpx.MockTransport(transport)) as http:
+        async with httpx.AsyncClient(transport=old_server(transport)) as http:
             await client_for(http, token=token).ingest_notifications([timeline([item(i) for i in range(20)])])
         assert requests[0][0] == requests[1][0]
         assert refreshes == [False, True]
@@ -163,7 +164,7 @@ def test_S4_413_is_typed_and_sanitized():
         from connector.server.ingest_batching import ConnectorIngestSizeError
         def transport(request):
             return httpx.Response(413, text="sensitive upstream response must not be logged")
-        async with httpx.AsyncClient(transport=httpx.MockTransport(transport)) as http:
+        async with httpx.AsyncClient(transport=old_server(transport)) as http:
             with pytest.raises(ConnectorIngestSizeError) as error:
                 await client_for(http).ingest_notifications([timeline([item(0)])])
         assert error.value.reason == "http_413"
@@ -179,7 +180,7 @@ def test_S7_pending_size_rejection_does_not_blame_or_block_direct_session():
                 return httpx.Response(413)
             delivered.extend(json.loads(request.content)["notifications"])
             return httpx.Response(200, json={"rejected": []})
-        async with httpx.AsyncClient(transport=httpx.MockTransport(transport)) as http:
+        async with httpx.AsyncClient(transport=old_server(transport)) as http:
             ingest = client_for(http)
             await ingest.enqueue("timeline.sync", timeline([item(0, "x" * 3000)], session="bad")["params"])
             await ingest.ingest_notifications([timeline([item(1)], session="healthy")])
@@ -206,7 +207,7 @@ def test_S9_encoding_runs_in_worker_and_pages_are_lazy(monkeypatch):
             if not first_post_count:
                 first_post_count.append(len(encoded_items))
             return httpx.Response(200, json={"rejected": []})
-        async with httpx.AsyncClient(transport=httpx.MockTransport(transport)) as http:
+        async with httpx.AsyncClient(transport=old_server(transport)) as http:
             await client_for(http).ingest_notifications([timeline([item(i) for i in range(100)])])
         assert main not in threads and threads
         assert 0 < first_post_count[0] < 100, "S9: must not encode all pages before first send"
@@ -224,7 +225,7 @@ def test_S8_history_over_50_MiB_uses_mocked_bounded_requests():
             sizes.append(len(request.content))
             ids.extend(i["id"] for n in json.loads(request.content)["notifications"] for i in n["params"]["items"])
             return httpx.Response(200, json={"rejected": []})
-        async with httpx.AsyncClient(transport=httpx.MockTransport(transport)) as http:
+        async with httpx.AsyncClient(transport=old_server(transport)) as http:
             await client_for(http, budget).ingest_notifications([timeline(rows)])
         assert sum(sizes) > 50 * 1024 * 1024
         assert max(sizes) <= budget and len(sizes) > 1
@@ -239,7 +240,7 @@ def test_S10_default_budget_sends_9_MiB_replacement_whole_like_main():
         def transport(request):
             sizes.append(len(request.content))
             return httpx.Response(200, json={"rejected": []})
-        async with httpx.AsyncClient(transport=httpx.MockTransport(transport)) as http:
+        async with httpx.AsyncClient(transport=old_server(transport)) as http:
             ingest = ConnectorIngestClient("https://aa.example.invalid", _token, lambda: http, lambda timeout: http)
             await ingest.ingest_notifications([timeline(rows, complete=True)])
         assert len(sizes) == 1 and sizes[0] > 9 * 1024 * 1024
@@ -259,7 +260,7 @@ def test_S11_oversized_notification_rejects_only_itself_in_a_batch():
                 return httpx.Response(413)
             delivered.extend(json.loads(request.content)["notifications"])
             return httpx.Response(200, json={"rejected": []})
-        async with httpx.AsyncClient(transport=httpx.MockTransport(transport)) as http:
+        async with httpx.AsyncClient(transport=old_server(transport)) as http:
             ingest = client_for(http)
             with pytest.raises(ConnectorIngestSizeError):
                 await ingest.ingest_notifications([before, oversized, *after])
@@ -292,7 +293,7 @@ def test_S12_page_413_below_budget_retries_each_notification_alone():
                 return httpx.Response(413)
             delivered.extend(json.loads(request.content)["notifications"])
             return httpx.Response(200, json={"rejected": []})
-        async with httpx.AsyncClient(transport=httpx.MockTransport(transport)) as http:
+        async with httpx.AsyncClient(transport=old_server(transport)) as http:
             with pytest.raises(ConnectorIngestSizeError):
                 await client_for(http).ingest_notifications([small[0], large, *small[1:]])
         assert delivered == small
@@ -312,7 +313,7 @@ def test_S13_transient_failure_resumes_at_unaccepted_page_without_replay():
                 return httpx.Response(503)
             bodies.append(notifications)
             return httpx.Response(200, json={"rejected": []})
-        async with httpx.AsyncClient(transport=httpx.MockTransport(transport)) as http:
+        async with httpx.AsyncClient(transport=old_server(transport)) as http:
             ingest = client_for(http)
             ingest._retry_delay = 0.001
             await ingest.enqueue("session.turnEnded", turn_ended["params"])

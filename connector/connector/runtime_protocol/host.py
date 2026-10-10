@@ -34,6 +34,15 @@ class RuntimeHostClient(ABC):
         """Await the existing Connector ingest path, without the fallback queue."""
         raise NotImplementedError("Synchronous notification ingestion is unavailable")
 
+    async def read_timeline_manifest(
+        self, runtime: str, params: dict[str, Any], runtime_id: str | None = None
+    ) -> dict[str, tuple[int, str]] | None:
+        """The stored ``(orderSeq, contentHash)`` per item of one session.
+
+        None when the backend has no manifest; a complete snapshot is then
+        sent whole, as before.
+        """
+
     @property
     @abstractmethod
     def connector_id(self) -> str:

@@ -46,6 +46,8 @@ class ConnectorRuntimeHost(RuntimeHostClient):
         ingest_notifications: Callable[[list[dict[str, Any]]], Awaitable[None]] | None = None,
         *,
         defer_payload_projection: bool = False,
+        timeline_manifest_reader: Callable[[dict[str, Any]], Awaitable[dict[str, tuple[int, str]] | None]]
+        | None = None,
     ) -> None:
         self._connector_id = connector_id
         self._notifier = notifier
@@ -53,6 +55,7 @@ class ConnectorRuntimeHost(RuntimeHostClient):
         self._sync_state_store = sync_state_store
         self._memory_sync_state: dict[str, Mapping[str, Any]] = {}
         self._ingest_notifications = ingest_notifications
+        self._timeline_manifest_reader = timeline_manifest_reader
         self._defer_payload_projection = defer_payload_projection
         self._runtime_storage = RuntimeStorageManager(sync_state_store) if isinstance(sync_state_store, JsonSyncStateStore) else None
         self._runtime_kv = None
@@ -80,7 +83,7 @@ class ConnectorRuntimeHost(RuntimeHostClient):
             raise RuntimeError("Synchronous notification ingestion is unavailable")
         allowed = {"session.meta.upsert", "session.source.updated", "session.state.updated",
                    "session.turnEnded", "session.inventory.begin", "session.inventory.complete",
-                   "timeline.sync", "timeline.itemUpsert"}
+                   "timeline.sync", "timeline.itemUpsert", "timeline.delete"}
         bound = []
         for notice in notifications:
             if notice.get("method") not in allowed or not isinstance(notice.get("params"), dict):
@@ -88,6 +91,14 @@ class ConnectorRuntimeHost(RuntimeHostClient):
             params = {**notice["params"], "runtime": runtime, "runtimeId": runtime_id or runtime}
             bound.append({"method": notice["method"], "params": server_payload_without_turn_data(params)})
         await self._ingest_notifications(bound)
+
+    async def read_timeline_manifest(
+        self, runtime: str, params: dict[str, Any], *, runtime_id: str | None = None
+    ) -> dict[str, tuple[int, str]] | None:
+        if self._timeline_manifest_reader is None:
+            return None
+        return await self._timeline_manifest_reader(
+            {**params, "runtime": runtime, "runtimeId": runtime_id or runtime})
 
     @property
     def connector_id(self) -> str:

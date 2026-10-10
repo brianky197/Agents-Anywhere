@@ -26,7 +26,9 @@ def item(item_id="one", session_id="session"):
 
 
 def host():
-    return SimpleNamespace(publish_runtime_notifications=AsyncMock(), sync_state_write=AsyncMock(), runtime_health_update=AsyncMock())
+    # read_timeline_manifest: a backend without the timeline manifest (issue #278).
+    return SimpleNamespace(publish_runtime_notifications=AsyncMock(), sync_state_write=AsyncMock(),
+                           runtime_health_update=AsyncMock(), read_timeline_manifest=AsyncMock(return_value=None))
 
 
 def operation(kind, **values):

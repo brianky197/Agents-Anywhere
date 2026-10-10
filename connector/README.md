@@ -197,15 +197,21 @@ separately and configure a Pi runtime with an executable, session directory and
 working directory. `ask-writes` remains the default; tool approval is not an OS
 sandbox. Pointing at an existing session directory uploads its history to AA.
 
-Incremental history ingest is byte-batched (8 MiB pages by default). Whole
-replacement snapshots and other indivisible records are never split, truncated or
-mislabelled as a final page; they travel whole in their own request and only the
-server can reject them as too large (HTTP 413). A rejected notification is
-skipped without dropping the rest of its batch, and a transient failure resumes
-at the first unaccepted page. Checkpoints advance only after every page is
-accepted. A DSH session whose complete snapshot the server refuses is isolated
-and reported as unavailable, so the other DSH sessions keep syncing; refusals
-other than 413 are retried with a fresh capture after a backoff. See
+Incremental history ingest is byte-batched (8 MiB pages by default). A complete
+snapshot is never split into pages or mislabelled as a final page. With a server
+that serves the timeline manifest, it is reconciled instead: the Connector reads
+what the server stores, uploads only the items whose order or content differ as
+an ordinary incremental sync, and deletes the IDs the snapshot no longer has
+(issue #278, see the reconcile section of
+[docs/api/realtime.md](../docs/api/realtime.md)). Unchanged history is not
+uploaded again, and no request has to hold a whole session. An older server gets
+the snapshot whole, in its own request, and only it can reject that as too large
+(HTTP 413). A rejected notification is skipped without dropping the rest of its
+batch, and a transient failure resumes at the first unaccepted page.
+Checkpoints advance only after every page is accepted. A DSH session whose
+history the server still refuses is isolated and reported as unavailable, so the
+other DSH sessions keep syncing; refusals other than 413 are retried with a fresh
+capture after a backoff. See
 [Pi integration and sync boundaries](../docs/runtime-protocol/pi.md) for
 configuration, migration, verification and licensing details.
 

@@ -21,6 +21,8 @@ def backend_client(tmp_path):
     )
     client._ingest.ingest_notifications = AsyncMock()
     client._ingest.enqueue = AsyncMock()
+    # A backend without the timeline manifest: snapshots are sent whole.
+    client._ingest.read_timeline_manifest = AsyncMock(return_value=None)
     client._timeline_notifications.send = AsyncMock(wraps=client._timeline_notifications.send)
     host = RuntimeInstanceHost(client.agent_runtime_host,
         RuntimeInstanceSpec(runtime_id="rti_dsh", runtime_type="dsh", name="DSH"))

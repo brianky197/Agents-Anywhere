@@ -199,6 +199,12 @@ class RuntimeInstanceHost(RuntimeHostClient):
         self._validate_native_runtime(runtime)
         await self.base.publish_runtime_notifications(runtime, notifications, runtime_id=self.instance.runtime_id)
 
+    async def read_timeline_manifest(
+        self, runtime: str, params: dict[str, Any], *, runtime_id: str | None = None
+    ) -> dict[str, tuple[int, str]] | None:
+        self._validate_native_runtime(runtime)
+        return await self.base.read_timeline_manifest(runtime, params, runtime_id=self.instance.runtime_id)
+
     async def session_meta_upsert(
         self,
         session_id: str,

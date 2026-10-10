@@ -4,9 +4,11 @@ Use the real DSH relay, host binding and ingest client with synthetic history an
 an in-process gateway that rejects bodies over a size limit (50 MiB like the
 public ingress unless stated otherwise). Never send history to a real server.
 
-The Connector now isolates a session whose complete snapshot the backend refuses;
-its history stays unsynchronized. Uploading such a snapshot needs the staged
-snapshot protocol, which these tests do not claim.
+The gateways here are Servers from before the timeline manifest (it answers 404),
+so complete snapshots still travel whole. Against them the Connector isolates a
+session whose complete snapshot is refused, and its history stays
+unsynchronized. ``test_issue_278_reconcile.py`` covers Servers with the manifest,
+where such a snapshot is reconciled in bounded requests.
 """
 from __future__ import annotations
 
@@ -16,6 +18,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import httpx
+from ingest_servers import old_server
 
 from connector.runtime_protocol import (
     RuntimeInstanceHost,
@@ -133,7 +136,7 @@ def notifications(*notes):
 def test_issue278_legacy_complete_snapshot_over_50_mib_receives_413():
     async def run():
         gateway = Gateway()
-        async with httpx.AsyncClient(transport=httpx.MockTransport(gateway)) as http:
+        async with httpx.AsyncClient(transport=old_server(gateway)) as http:
             host, health = stack(http, legacy=True)
             relay = SyncRelay(Mock(), host)
             try:
@@ -153,7 +156,7 @@ def test_issue278_legacy_complete_snapshot_over_50_mib_receives_413():
 def test_issue278_oversized_snapshot_quarantines_only_that_session():
     async def run():
         gateway = Gateway()
-        async with httpx.AsyncClient(transport=httpx.MockTransport(gateway)) as http:
+        async with httpx.AsyncClient(transport=old_server(gateway)) as http:
             host, health = stack(http)
             relay = SyncRelay(Mock(), host)
             try:
@@ -201,7 +204,7 @@ def test_issue278_oversized_snapshot_quarantines_only_that_session():
 def test_issue278_unchanged_rejected_capture_is_not_uploaded_again_and_a_new_one_is():
     async def run():
         gateway = Gateway(limit=64 * 1024)
-        async with httpx.AsyncClient(transport=httpx.MockTransport(gateway)) as http:
+        async with httpx.AsyncClient(transport=old_server(gateway)) as http:
             host, _ = stack(http, budget=16 * 1024)
             relay = SyncRelay(Mock(), host)
             try:
@@ -237,7 +240,7 @@ def test_issue278_incremental_55_mib_pages_pass_gateway_but_are_not_replacements
     async def run():
         gateway = Gateway()
         items = make_items(11, 5 * MIB)
-        async with httpx.AsyncClient(transport=httpx.MockTransport(gateway)) as http:
+        async with httpx.AsyncClient(transport=old_server(gateway)) as http:
             host, _ = stack(http)
             await host.publish_runtime_notifications("dsh", [{"method": "timeline.sync", "params": {
                 "sessionId": SESSION, "externalSessionId": EXTERNAL, "items": items, "complete": False}}])
@@ -254,7 +257,7 @@ def test_issue278_9_mib_snapshot_is_accepted_whole_like_legacy():
         items = make_items(3, 3 * MIB)
         for legacy in (True, False):
             gateway = Gateway()
-            async with httpx.AsyncClient(transport=httpx.MockTransport(gateway)) as http:
+            async with httpx.AsyncClient(transport=old_server(gateway)) as http:
                 host, _ = stack(http, legacy=legacy)
                 relay = SyncRelay(Mock(), host)
                 try:
@@ -286,7 +289,7 @@ def test_issue278_oversized_snapshot_is_acked_and_feed_reaches_running():
             acked.append(params["batchSeq"])
             acks.put_nowait(params["batchSeq"])
 
-        async with httpx.AsyncClient(transport=httpx.MockTransport(gateway)) as http:
+        async with httpx.AsyncClient(transport=old_server(gateway)) as http:
             host, health = stack(http, budget=2048)
             previous = {**CHECKPOINT, "throughSeq": 1}
             await host.sync_state_write(CHECKPOINT_KEY, previous)
@@ -326,7 +329,7 @@ def test_issue278_rejected_snapshot_is_retried_with_a_fresh_capture():
             assert method == "runtime.sync.refresh"
             refreshes.put_nowait(params)
 
-        async with httpx.AsyncClient(transport=httpx.MockTransport(gateway)) as http:
+        async with httpx.AsyncClient(transport=old_server(gateway)) as http:
             host, _ = stack(http)
             relay = SyncRelay(SimpleNamespace(request=request), host, rejected_retry_delay=0.01)
             items = make_items(3, 1024)
@@ -370,7 +373,7 @@ def test_issue278_recovery_does_not_restate_over_a_newer_host_fact():
         async def request(method, params=None):
             return None
 
-        async with httpx.AsyncClient(transport=httpx.MockTransport(gateway)) as http:
+        async with httpx.AsyncClient(transport=old_server(gateway)) as http:
             host, _ = stack(http)
             relay = SyncRelay(SimpleNamespace(request=request), host, rejected_retry_delay=60)
             items = make_items(2, 1024)
@@ -400,7 +403,7 @@ def test_issue278_recovery_restates_once_the_host_reports_available_again():
         async def request(method, params=None):
             return None
 
-        async with httpx.AsyncClient(transport=httpx.MockTransport(gateway)) as http:
+        async with httpx.AsyncClient(transport=old_server(gateway)) as http:
             host, _ = stack(http)
             relay = SyncRelay(SimpleNamespace(request=request), host, rejected_retry_delay=60)
             items = make_items(2, 1024)
@@ -424,7 +427,7 @@ def test_issue278_recovery_restates_once_the_host_reports_available_again():
 def test_issue278_state_reads_and_host_metadata_keep_a_quarantined_session_unavailable(tmp_path):
     async def run():
         gateway = Gateway(limit=64 * 1024)
-        async with httpx.AsyncClient(transport=httpx.MockTransport(gateway)) as http:
+        async with httpx.AsyncClient(transport=old_server(gateway)) as http:
             host, _ = stack(http, budget=16 * 1024)
             relay = SyncRelay(Mock(), host)
             try:

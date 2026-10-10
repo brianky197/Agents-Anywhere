@@ -6,7 +6,7 @@ import sys
 import tempfile
 from collections.abc import Mapping
 from contextlib import ExitStack
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
@@ -30,6 +30,11 @@ from connector.runtimes.dsh.bridge.models import (
 from connector.runtimes.dsh.bridge.models import notice as session_notice
 from connector.server.ingest import ConnectorIngestRejectedError
 from connector.server.ingest_batching import ConnectorIngestSizeError
+from connector.server.ingest_reconcile import (
+    changed_items,
+    delete_notifications,
+    external_session_id,
+)
 
 _DURABLE_NOTIFICATIONS = {
     "timeline.itemUpsert", "session.meta.upsert", "session.state.updated",
@@ -48,6 +53,23 @@ REJECTED_RETRY_MAX_DELAY_SECONDS = 30 * 60.0
 # History for a quarantined session would land on a timeline the backend never
 # received a baseline for. Its metadata and state still flow.
 _QUARANTINED_HISTORY = {"timeline.itemUpsert", "session.turnEnded"}
+
+
+@dataclass
+class _Reconcile:
+    """A capture reconciled against the backend's stored timeline (issue #278).
+
+    Each page uploads only the items that differ, as it arrives, so the commit
+    ACK (the bridge gives up after 60 seconds) never waits for the whole
+    history. The commit then deletes stored items the capture does not have.
+    """
+
+    manifest: dict[str, tuple[int, str]] | None
+    external_session_id: str | None = None
+    seen: set[str] = field(default_factory=set)
+    # The backend has no manifest, or a page was refused: the commit sends the
+    # spooled capture as one complete timeline.sync instead.
+    failed: bool = False
 
 
 @dataclass
@@ -106,6 +128,7 @@ class SyncRelay:
         # an unchanged oversized capture is not uploaded again; a restart
         # retries it.
         self.quarantined: dict[str, _Quarantine] = {}
+        self.reconcile: _Reconcile | None = None
 
     def start(self) -> None:
         self.task = asyncio.create_task(self.run(), name="dsh-event-sync")
@@ -136,6 +159,8 @@ class SyncRelay:
     def clear_snapshot(self) -> None:
         self.spool.close()
         self.file, self.snapshot = None, None
+        # Items already uploaded stay: they are current items of the session.
+        self.reconcile = None
         self.item_ids.clear()
         self.items = []
         self.item_bytes = 0
@@ -178,6 +203,7 @@ class SyncRelay:
                         raise ValueError("Invalid snapshot item identity")
                     self.item_ids.add(item.id)
                 await self.store_items(op["items"])
+                await self.reconcile_page(op["sessionId"], op["items"])
             elif kind == "snapshot.commit":
                 if len(self.item_ids) != op.get("totalItems") or op.get("throughSeq") != self.snapshot["throughSeq"]:
                     raise ValueError("Incomplete snapshot; previous backend history remains intact")
@@ -212,27 +238,91 @@ class SyncRelay:
         else:
             raise ValueError(f"Unsupported bridge operation: {kind}")
 
-    async def commit_snapshot(self, session_id: str, snapshot: dict[str, Any]) -> None:
-        meta = snapshot["meta"]
-        meta_notice = {"method": "session.meta.upsert", "params": {"sessionId": session_id, **meta}}
+    def unchanged_refusal(self, session_id: str, snapshot: dict[str, Any]) -> _Quarantine | None:
+        """The quarantine of an identical capture that was too large."""
         rejected = self.quarantined.get(session_id)
         if rejected is not None and not rejected.retryable and rejected.through_seq == snapshot["throughSeq"]:
+            return rejected
+        return None
+
+    async def reconcile_page(self, session_id: str, items: list[dict[str, Any]]) -> None:
+        """Upload what one snapshot page changes on the backend's timeline."""
+        snapshot = self.snapshot
+        if snapshot is None or self.unchanged_refusal(session_id, snapshot) is not None:
+            return
+        if self.reconcile is None:
+            # Read with the page's own items, as the backend resolves the sync.
+            external = external_session_id(items)
+            manifest = await self.host.read_timeline_manifest(
+                "dsh", {"sessionId": session_id, **({"externalSessionId": external} if external else {})})
+            self.reconcile = _Reconcile(manifest, external, failed=manifest is None)
+            if manifest is not None:
+                try:
+                    # The items need their session; an unknown one drops them.
+                    await self.host.publish_runtime_notifications(
+                        "dsh", [self.unquarantined(self.meta_notice(session_id, snapshot))])
+                except _SESSION_INGEST_ERRORS as error:
+                    self.reconcile.failed = True
+                    logger.info("DSH snapshot metadata refused; the commit sends it whole error={}", error)
+        reconcile = self.reconcile
+        if reconcile.failed or reconcile.manifest is None:
+            return
+        reconcile.seen.update(item["id"] for item in items)
+        changed = changed_items(items, reconcile.manifest)
+        if not changed:
+            return
+        try:
+            await self.host.publish_runtime_notifications("dsh", [{"method": "timeline.sync", "params": {
+                "sessionId": session_id, "externalSessionId": snapshot["meta"]["externalSessionId"],
+                "complete": False, "orderAuthoritative": True, "items": changed}}])
+        except _SESSION_INGEST_ERRORS as error:
+            # A network failure still fails the feed, as for any history.
+            reconcile.failed = True
+            logger.info("DSH snapshot page refused; the commit sends it whole error={}", error)
+
+    async def commit_reconcile(self, session_id: str, meta_notice: dict[str, Any]) -> bool:
+        """Delete what the capture no longer has; False leaves it to the whole path."""
+        reconcile = self.reconcile
+        if reconcile is None or reconcile.failed or reconcile.manifest is None:
+            return False
+        removed = [item_id for item_id in reconcile.manifest if item_id not in reconcile.seen]
+        try:
+            await self.host.publish_runtime_notifications("dsh", [
+                meta_notice,
+                *delete_notifications({"sessionId": session_id}, reconcile.external_session_id, removed),
+            ])
+        except _SESSION_INGEST_ERRORS as error:
+            logger.info("DSH snapshot commit refused; sending it whole error={}", error)
+            return False
+        return True
+
+    @staticmethod
+    def meta_notice(session_id: str, snapshot: dict[str, Any]) -> dict[str, Any]:
+        return {"method": "session.meta.upsert", "params": {"sessionId": session_id, **snapshot["meta"]}}
+
+    async def commit_snapshot(self, session_id: str, snapshot: dict[str, Any]) -> None:
+        meta = snapshot["meta"]
+        meta_notice = self.meta_notice(session_id, snapshot)
+        rejected = self.unchanged_refusal(session_id, snapshot)
+        if rejected is not None:
             # Same capture as the oversized one. Keep the metadata current without
             # uploading the history again or reporting the source as available.
             meta_notice["params"]["sourceState"] = rejected.source_state
             await self.host.publish_runtime_notifications("dsh", [meta_notice])
             return
-        items = await self.load_items()
-        try:
-            # Reuse the existing complete snapshot API only after every page is received.
-            await self.host.publish_runtime_notifications("dsh", [
-                meta_notice,
-                {"method": "timeline.sync", "params": {"sessionId": session_id,
-                    "externalSessionId": meta["externalSessionId"], "items": items, "complete": True}},
-            ])
-        except _SESSION_INGEST_ERRORS as error:
-            await self.quarantine(session_id, meta["externalSessionId"], snapshot["throughSeq"], error)
-            return
+        if not await self.commit_reconcile(session_id, meta_notice):
+            items = await self.load_items()
+            try:
+                # Reuse the existing complete snapshot API only after every page is
+                # received. The ingest client reconciles it against the manifest too.
+                await self.host.publish_runtime_notifications("dsh", [
+                    meta_notice,
+                    {"method": "timeline.sync", "params": {"sessionId": session_id,
+                        "externalSessionId": meta["externalSessionId"], "items": items, "complete": True}},
+                ])
+            except _SESSION_INGEST_ERRORS as error:
+                await self.quarantine(session_id, meta["externalSessionId"], snapshot["throughSeq"], error)
+                return
         released = self.quarantined.pop(session_id, None)
         source = meta.get("sourceState")
         if released is not None and not released.host_fact and isinstance(source, dict):

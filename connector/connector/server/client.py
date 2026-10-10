@@ -56,7 +56,7 @@ from connector.server.urls import (
     ws_url as build_ws_url,
 )
 
-INGEST_ONLY_NOTIFICATION_METHODS = frozenset({"timeline.sync"})
+INGEST_ONLY_NOTIFICATION_METHODS = frozenset({"timeline.sync", "timeline.delete"})
 SYNC_STATE_FLUSH_INTERVAL_SECONDS = 1.0
 
 
@@ -83,6 +83,7 @@ class BackendRpcClient:
             sync_state_store=self.sync_state_store,
             ingest_notifications=self.ingest_notifications,
             defer_payload_projection=True,
+            timeline_manifest_reader=self.read_timeline_manifest,
         )
         if agent_runtime_providers is None:
             agent_runtime_providers = default_runtime_providers()
@@ -436,6 +437,9 @@ class BackendRpcClient:
 
     async def ingest_notifications(self, notifications: list[dict[str, Any]]) -> None:
         await self._ingest.ingest_notifications(notifications)
+
+    async def read_timeline_manifest(self, params: dict[str, Any]) -> dict[str, tuple[int, str]] | None:
+        return await self._ingest.read_timeline_manifest(params)
 
     async def download_attachment(
         self, session_id: str, file_id: str

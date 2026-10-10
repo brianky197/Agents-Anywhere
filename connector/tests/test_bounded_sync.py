@@ -6,6 +6,7 @@ from collections import Counter
 
 import httpx
 import pytest
+from ingest_servers import old_server
 from test_bounded_ingest import client_for
 from test_connector_runtime import (
     FakeAgentRuntime,
@@ -85,7 +86,7 @@ def test_S3_partial_network_failure_replay_preserves_ids_and_checkpoint():
                     for row in note["params"]["items"]:
                         server_items[row["id"]] = row
             return httpx.Response(200, json={"rejected": []})
-        async with httpx.AsyncClient(transport=httpx.MockTransport(transport)) as http:
+        async with httpx.AsyncClient(transport=old_server(transport)) as http:
             runner = runner_for(runtime, client_for(http, 1200))
             with pytest.raises(ConnectorNetworkError):
                 await runner.sync_existing_session(runtime, runtime.session("large"), recovering=True)
@@ -108,7 +109,7 @@ def test_S4_failed_or_cancelled_page_never_commits(failure):
             if failure == "reject":
                 return httpx.Response(200, json={"rejected": [{"method": "timeline.sync", "code": "test"}]})
             return httpx.Response(int(failure))
-        async with httpx.AsyncClient(transport=httpx.MockTransport(transport)) as http:
+        async with httpx.AsyncClient(transport=old_server(transport)) as http:
             runner = runner_for(runtime, client_for(http, 1200))
             if failure == "413":
                 assert await runner.sync_existing_session(runtime, runtime.session("large"), recovering=True) is False
@@ -139,7 +140,7 @@ def test_S5_413_cooldown_is_session_local_and_source_change_retries():
                     if sid == "large":
                         return httpx.Response(413)
             return httpx.Response(200, json={"rejected": []})
-        async with httpx.AsyncClient(transport=httpx.MockTransport(transport)) as http:
+        async with httpx.AsyncClient(transport=old_server(transport)) as http:
             runner = runner_for(runtime, client_for(http, 1200))
             runner._ingest_retry_seconds = 60
             runner._ingest_clock = lambda: clock[0]
@@ -168,7 +169,7 @@ def test_S5_item_over_page_budget_travels_alone_and_commits():
                 if note["method"] == "timeline.sync":
                     timeline_items.append([row["id"] for row in note["params"]["items"]])
             return httpx.Response(200, json={"rejected": []})
-        async with httpx.AsyncClient(transport=httpx.MockTransport(transport)) as http:
+        async with httpx.AsyncClient(transport=old_server(transport)) as http:
             runner = runner_for(runtime, client_for(http, 400))
             assert await runner.sync_existing_session(runtime, runtime.session("large"), recovering=True) is not False
             # Only the server may reject a request as too large.
