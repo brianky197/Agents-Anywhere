@@ -14,6 +14,8 @@ from dataclasses import dataclass
 from typing import Any
 
 MAX_INGEST_BODY_BYTES = 8 * 1024 * 1024
+# Connector-internal state a notification may carry; never sent.
+RECONCILE_KEY = "_reconcile"
 _BODY_PREFIX = b'{"notifications":['
 _BODY_SUFFIX = b']}'
 _ENVELOPE_BYTES = len(_BODY_PREFIX) + len(_BODY_SUFFIX)
@@ -48,6 +50,9 @@ class IngestFragment:
     data: bytes
     method: str
     after: tuple[int, int]
+    # A reconcile write (orderAuthoritative sync or timeline.delete): only a
+    # response that confirms the reconcile feature shows it was applied.
+    reconcile: bool = False
 
 
 @dataclass(frozen=True)
@@ -78,15 +83,19 @@ def _encode_json(value: Any) -> bytes:
 def _notification_fragments(
     index: int, notification: dict[str, Any], budget: int,
 ) -> Iterator[IngestFragment]:
+    if RECONCILE_KEY in notification:
+        notification = {key: value for key, value in notification.items() if key != RECONCILE_KEY}
     method = str(notification.get("method"))
     params = notification.get("params")
+    reconcile = method == "timeline.delete" or (
+        method == "timeline.sync" and isinstance(params, dict) and params.get("orderAuthoritative") is True)
     if (method != "timeline.sync"
             or not isinstance(params, dict)
             or params.get("complete") is True
             or not isinstance(params.get("items"), list)
             or not params["items"]):
         # An explicitly empty timeline is a meaningful notification, not a no-op.
-        yield IngestFragment(_encode_json(notification), method, (index + 1, 0))
+        yield IngestFragment(_encode_json(notification), method, (index + 1, 0), reconcile)
         return
 
     outer = {k: v for k, v in notification.items() if k != "params"}
@@ -104,13 +113,13 @@ def _notification_fragments(
         encoded = _encode_json(item)
         added = len(encoded) + bool(parts)
         if parts and size + added > budget:
-            yield IngestFragment(prefix + b",".join(parts) + suffix, method, (index, position))
+            yield IngestFragment(prefix + b",".join(parts) + suffix, method, (index, position), reconcile)
             parts = []
             size = overhead
         # A single item larger than the budget still travels whole, alone.
         size += len(encoded) + bool(parts)
         parts.append(encoded)
-    yield IngestFragment(prefix + b",".join(parts) + suffix, method, (index + 1, 0))
+    yield IngestFragment(prefix + b",".join(parts) + suffix, method, (index + 1, 0), reconcile)
 
 
 def iter_ingest_pages(

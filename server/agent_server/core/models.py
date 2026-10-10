@@ -644,9 +644,16 @@ class ConnectorIngestRejectedNotification(BaseModel):
     errorType: str | None = None
 
 
+# Ingest semantics this Server applies. An older Server accepts unknown
+# notifications and parameters as no-ops, so a Connector only trusts reconcile
+# writes (orderAuthoritative, timeline.delete) answered with this feature.
+CONNECTOR_INGEST_FEATURES = ("timeline.reconcile",)
+
+
 class ConnectorIngestResponse(BaseModel):
     accepted: int
     rejected: list[ConnectorIngestRejectedNotification] = Field(default_factory=list)
+    features: list[str] = Field(default_factory=lambda: list(CONNECTOR_INGEST_FEATURES))
     serverTime: str
 
 

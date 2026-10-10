@@ -338,3 +338,77 @@ def test_connector_reconciles_a_snapshot_the_ingress_would_refuse(tmp_path):
     assert uploaded == ["m2", "m1", "m3", "new"]
     assert deleted == ["m4"]
     assert not any(note["params"].get("complete") for note in notes)
+
+
+def test_ingest_responses_confirm_reconcile_writes(tmp_path):
+    client = make_client(tmp_path)
+    _, token, session_id, _ = create_connector_and_session(client)
+
+    body = _ingest(client, token, _delete(session_id, ["none"]))
+
+    assert body["features"] == ["timeline.reconcile"]
+
+
+def test_manifest_includes_items_accepted_but_not_yet_stored(tmp_path):
+    """A replacing snapshot would remove a buffered item, so the manifest lists it."""
+
+    client = make_client(tmp_path)
+    _, token, session_id, _ = create_connector_and_session(client)
+    _ingest(client, token, _sync(session_id, [_item(session_id, "a", 1)], complete=True))
+    _ingest(
+        client,
+        token,
+        {"method": "timeline.itemUpsert", "params": {"sessionId": session_id, "runtime": "codex",
+                                                      "item": _item(session_id, "live", 2)}},
+    )
+
+    ids = [entry["id"] for entry in _manifest(client, token, session_id).json()["items"]]
+
+    assert ids == ["a", "live"]
+
+
+def test_reconcile_writes_resolve_the_session_they_name(tmp_path):
+    """Pages of changed items resolve the session by externalSessionId, not by their items."""
+
+    client = make_client(tmp_path)
+    _, token, session_id, headers = create_connector_and_session(client)
+    external = client.get(f"/sessions/{session_id}/meta", headers=headers).json()["session"]["externalSessionId"]
+    alias = "alias-the-server-does-not-know"
+    anonymous = {**_item(session_id, "x", 1), "source": {"runtime": "codex", "itemId": "x"}}
+
+    _ingest(client, token, _sync(alias, [anonymous], orderAuthoritative=True, externalSessionId=external))
+    assert _ids(client, session_id, headers) == ["x"]
+
+    manifest = _manifest(client, token, alias, externalSessionId=external).json()
+    assert [entry["id"] for entry in manifest["items"]] == ["x"]
+
+    delete = _delete(alias, ["x"])
+    delete["params"]["externalSessionId"] = external
+    _ingest(client, token, delete)
+    assert _ids(client, session_id, headers) == []
+
+
+def test_restating_the_hosts_source_fact_keeps_it(tmp_path):
+    """What the DSH relay sends during a quarantine: the Host's own fact, not none."""
+
+    client = make_client(tmp_path)
+    _, token, session_id, headers = create_connector_and_session(client, runtime="dsh")
+    archived = {"availability": "archived", "reason": "archived_in_dsh",
+                "observedAt": "2026-10-10T10:00:00Z", "observationOrigin": "event"}
+    _ingest(client, token, {"method": "session.source.updated",
+                            "params": {"sessionId": session_id, "runtime": "dsh", **archived}})
+
+    def source() -> tuple[str, str | None, str | None]:
+        session = client.get(f"/sessions/{session_id}/meta", headers=headers).json()["session"]
+        return session["sourceAvailability"], session["sourceAvailabilityReason"], session["sourceAvailabilityUpdatedAt"]
+
+    before = source()
+    assert before[0] == "archived"
+
+    _ingest(client, token, {"method": "session.meta.upsert",
+                            "params": {"sessionId": session_id, "runtime": "dsh", "sourceState": archived}})
+    assert source() == before
+
+    # Without a source fact, DSH metadata is read as available as of now.
+    _ingest(client, token, {"method": "session.meta.upsert", "params": {"sessionId": session_id, "runtime": "dsh"}})
+    assert source()[0] != "archived"

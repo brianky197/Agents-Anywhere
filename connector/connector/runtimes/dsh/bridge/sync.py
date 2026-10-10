@@ -33,7 +33,7 @@ from connector.server.ingest_batching import ConnectorIngestSizeError
 from connector.server.ingest_reconcile import (
     changed_items,
     delete_notifications,
-    external_session_id,
+    item_session_id,
 )
 
 _DURABLE_NOTIFICATIONS = {
@@ -53,6 +53,7 @@ REJECTED_RETRY_MAX_DELAY_SECONDS = 30 * 60.0
 # History for a quarantined session would land on a timeline the backend never
 # received a baseline for. Its metadata and state still flow.
 _QUARANTINED_HISTORY = {"timeline.itemUpsert", "session.turnEnded"}
+_SOURCE_FACT = ("availability", "reason", "observedAt", "observationOrigin")
 
 
 @dataclass
@@ -83,6 +84,8 @@ class _Quarantine:
     # The Host's latest source fact while quarantined is not "available"
     # (for example archived); a recovery must not override it.
     host_fact: bool = False
+    # That fact as reported, with its own observation time.
+    host_source: dict[str, Any] | None = None
 
 
 def _checkpoint(value: Any) -> dict[str, Any] | None:
@@ -192,6 +195,7 @@ class SyncRelay:
         elif kind == "snapshot.begin":
             self.clear_snapshot()
             self.snapshot = op
+            await self.begin_reconcile(op["sessionId"], op)
 
         elif kind in {"snapshot.items", "snapshot.commit", "snapshot.abort"}:
             if not self.snapshot or any(op.get(k) != self.snapshot.get(k) for k in ("snapshotId", "sessionId")):
@@ -245,27 +249,40 @@ class SyncRelay:
             return rejected
         return None
 
+    async def begin_reconcile(self, session_id: str, snapshot: dict[str, Any]) -> None:
+        """Read the backend's timeline before the first page arrives.
+
+        It happens within the begin ACK, so the pages' ACKs only wait for their
+        own changes. DSH items name the capture's native session in
+        ``source.sessionId``; every reconcile write names it too.
+        """
+        # A capture refused as too large is tried again here: reconciled, it
+        # may fit. Without a manifest, the commit only restates metadata.
+        external = snapshot["meta"].get("externalSessionId")
+        external = external if isinstance(external, str) and external else None
+        manifest = await self.host.read_timeline_manifest(
+            "dsh", {"sessionId": session_id, **({"externalSessionId": external} if external else {})})
+        self.reconcile = _Reconcile(manifest, external, failed=manifest is None)
+        if manifest is None:
+            return
+        try:
+            # The items need their session; an unknown one drops them.
+            await self.host.publish_runtime_notifications(
+                "dsh", [self.quarantined_meta(self.meta_notice(session_id, snapshot))])
+        except _SESSION_INGEST_ERRORS as error:
+            self.reconcile.failed = True
+            logger.info("DSH snapshot metadata refused; the commit sends it whole error={}", error)
+
     async def reconcile_page(self, session_id: str, items: list[dict[str, Any]]) -> None:
         """Upload what one snapshot page changes on the backend's timeline."""
-        snapshot = self.snapshot
-        if snapshot is None or self.unchanged_refusal(session_id, snapshot) is not None:
-            return
-        if self.reconcile is None:
-            # Read with the page's own items, as the backend resolves the sync.
-            external = external_session_id(items)
-            manifest = await self.host.read_timeline_manifest(
-                "dsh", {"sessionId": session_id, **({"externalSessionId": external} if external else {})})
-            self.reconcile = _Reconcile(manifest, external, failed=manifest is None)
-            if manifest is not None:
-                try:
-                    # The items need their session; an unknown one drops them.
-                    await self.host.publish_runtime_notifications(
-                        "dsh", [self.unquarantined(self.meta_notice(session_id, snapshot))])
-                except _SESSION_INGEST_ERRORS as error:
-                    self.reconcile.failed = True
-                    logger.info("DSH snapshot metadata refused; the commit sends it whole error={}", error)
         reconcile = self.reconcile
-        if reconcile.failed or reconcile.manifest is None:
+        if reconcile is None or reconcile.failed or reconcile.manifest is None:
+            return
+        if any(item_session_id(item) != reconcile.external_session_id for item in items):
+            # Every item must name the manifest's session, or none may: a
+            # Server too old for pinned resolution resolves a page by its items.
+            reconcile.failed = True
+            logger.info("DSH snapshot items name another session; the commit sends it whole")
             return
         reconcile.seen.update(item["id"] for item in items)
         changed = changed_items(items, reconcile.manifest)
@@ -273,7 +290,7 @@ class SyncRelay:
             return
         try:
             await self.host.publish_runtime_notifications("dsh", [{"method": "timeline.sync", "params": {
-                "sessionId": session_id, "externalSessionId": snapshot["meta"]["externalSessionId"],
+                "sessionId": session_id, "externalSessionId": reconcile.external_session_id,
                 "complete": False, "orderAuthoritative": True, "items": changed}}])
         except _SESSION_INGEST_ERRORS as error:
             # A network failure still fails the feed, as for any history.
@@ -303,14 +320,15 @@ class SyncRelay:
     async def commit_snapshot(self, session_id: str, snapshot: dict[str, Any]) -> None:
         meta = snapshot["meta"]
         meta_notice = self.meta_notice(session_id, snapshot)
-        rejected = self.unchanged_refusal(session_id, snapshot)
+        reconciled = await self.commit_reconcile(session_id, meta_notice)
+        rejected = None if reconciled else self.unchanged_refusal(session_id, snapshot)
         if rejected is not None:
             # Same capture as the oversized one. Keep the metadata current without
             # uploading the history again or reporting the source as available.
             meta_notice["params"]["sourceState"] = rejected.source_state
             await self.host.publish_runtime_notifications("dsh", [meta_notice])
             return
-        if not await self.commit_reconcile(session_id, meta_notice):
+        if not reconciled:
             items = await self.load_items()
             try:
                 # Reuse the existing complete snapshot API only after every page is
@@ -323,17 +341,22 @@ class SyncRelay:
             except _SESSION_INGEST_ERRORS as error:
                 await self.quarantine(session_id, meta["externalSessionId"], snapshot["throughSeq"], error)
                 return
-        released = self.quarantined.pop(session_id, None)
+        released = self.quarantined.get(session_id)
         source = meta.get("sourceState")
         if released is not None and not released.host_fact and isinstance(source, dict):
             # The capture's source fact carries its capture time, which can be
             # older than an unavailable observation reported while its pages
             # arrived; the Server keeps the newer one. Restate it as of now.
-            await self.host.publish_runtime_notifications("dsh", [{
-                "method": "session.source.updated",
-                "params": {"sessionId": session_id, "externalSessionId": meta["externalSessionId"],
-                           **source, "observedAt": _observed_now()},
-            }])
+            # A transient failure leaves the quarantine to the next capture.
+            try:
+                await self.host.publish_runtime_notifications("dsh", [{
+                    "method": "session.source.updated",
+                    "params": {"sessionId": session_id, "externalSessionId": meta["externalSessionId"],
+                               "observationOrigin": "event", **source, "observedAt": _observed_now()},
+                }])
+            except _SESSION_INGEST_ERRORS as error:
+                logger.warning("DSH source restatement refused session_id={} error={}", session_id, error)
+        self.quarantined.pop(session_id, None)
 
     async def quarantine(self, session_id: str, external_id: str, through_seq: Any, error: Exception) -> None:
         """Isolate one session whose history the backend refused.
@@ -351,7 +374,8 @@ class SyncRelay:
         previous = self.quarantined.get(session_id)
         record = _Quarantine(external_id, through_seq, source_state, retryable=not too_large,
                              attempts=previous.attempts + 1 if previous is not None else 1,
-                             host_fact=previous is not None and previous.host_fact)
+                             host_fact=previous is not None and previous.host_fact,
+                             host_source=previous.host_source if previous is not None else None)
         self.quarantined[session_id] = record
         logger.warning("DSH session history quarantined session_id={} reason={} attempts={} error={}",
                        session_id, reason, record.attempts, error)
@@ -381,6 +405,26 @@ class SyncRelay:
                 continue
             return
 
+    def quarantined_meta(self, notice: dict[str, Any]) -> dict[str, Any]:
+        """A capture's metadata, still reporting its session's quarantine.
+
+        Unlike ``unquarantined`` it leaves the Host's latest fact alone: the
+        capture's source fact may be older than one reported since.
+        """
+        params = notice["params"]
+        rejected = self.quarantined.get(params["sessionId"])
+        source = params.get("sourceState")
+        if rejected is None or not isinstance(source, dict) or source.get("availability") != "available":
+            return notice
+        if rejected.host_fact:
+            # The Host reported something else since. Restate that fact as it
+            # was observed, so the backend keeps it: metadata without a source
+            # fact would make the backend infer an available one as of now.
+            if rejected.host_source is None:
+                return notice
+            return {**notice, "params": {**params, "sourceState": rejected.host_source}}
+        return {**notice, "params": {**params, "sourceState": {**rejected.source_state, "observedAt": _observed_now()}}}
+
     def source_state_for(self, session_id: str, source: dict[str, Any]) -> dict[str, Any]:
         """The source fact to report for a session, honouring its quarantine."""
         rejected = self.quarantined.get(session_id)
@@ -390,6 +434,7 @@ class SyncRelay:
         # a recovery may restate the capture's source.
         rejected.host_fact = source.get("availability") != "available"
         if rejected.host_fact:
+            rejected.host_source = dict(source)
             return source
         return {**rejected.source_state, "observedAt": _observed_now()}
 
@@ -405,6 +450,8 @@ class SyncRelay:
                 return None
             if method == "session.source.updated":
                 rejected.host_fact = params.get("availability") != "available"
+                if rejected.host_fact:
+                    rejected.host_source = {key: params[key] for key in _SOURCE_FACT if key in params}
                 if not rejected.host_fact:
                     return None
             if method == "session.meta.upsert" and isinstance(params.get("sourceState"), dict):

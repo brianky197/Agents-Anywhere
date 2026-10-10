@@ -43,7 +43,9 @@ def make_items(count: int, payload_bytes: int, session: str = SESSION):
     digest = timeline_content_hash("message", "done", "assistant", content)
     return [{"id": f"item-{i}", "sessionId": session, "type": "message", "role": "assistant",
              "status": "done", "orderSeq": i + 1, "revision": 1, "content": content,
-             "source": {"runtime": "dsh"}, "contentHash": digest} for i in range(count)]
+             # Like real DSH items, each names its native session.
+             "source": {"runtime": "dsh", "sessionId": EXTERNAL if session == SESSION else f"native-{session}"},
+             "contentHash": digest} for i in range(count)]
 
 
 def op(kind: str, **values):

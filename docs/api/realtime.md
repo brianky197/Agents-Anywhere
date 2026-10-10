@@ -261,6 +261,7 @@ includes:
       "errorType": "ValidationError"
     }
   ],
+  "features": ["timeline.reconcile"],
   "serverTime": "..."
 }
 ```
@@ -288,43 +289,86 @@ POST /api/v2/connector/timeline/manifest
 
 - The manifest pages the stored items in `(orderSeq, id)` order, up to `limit`
   (default 1000, at most 5000) per page. Pass `next` back as `after` until it is
-  null. The session is resolved like `timeline.sync` resolves it, using
-  `externalSessionId` where the sync would use the first item's
-  `source.sessionId`. A session the Server does not have yet has an empty
-  manifest. It requires the Connector access token; an unconfigured runtime
-  answers 409 `runtime_not_configured`.
+  null. The session is resolved from `sessionId` and `externalSessionId`, as a
+  reconcile write naming the same pair resolves it. A session the Server does
+  not have yet has an empty manifest. Items accepted but still buffered for the
+  session are stored before the page is read, as a replacing snapshot would
+  store them, so they can be deleted too. It requires the Connector access
+  token; an unconfigured runtime answers 409 `runtime_not_configured`.
 - `timeline.sync` with `complete: false` and `orderAuthoritative: true` stores
   each item's `orderSeq` as given, also for existing items. An item whose order
-  or `contentHash` differs is written; others are unchanged. Moving an existing
-  item, or inserting one at or below the current last `orderSeq`, is a reset:
-  session subscribers get `session.refetch_required`, and event recovery from
-  before it reports `snapshotRequired`. Appending after the end publishes
-  ordinary item events.
+  or `contentHash` differs is written; others are unchanged. When the request
+  has an `externalSessionId` key (a null value included), the session is
+  resolved from it, like the manifest and `timeline.delete`, instead of from the
+  first item's `source.sessionId`, so every page of changed items lands in the
+  same session. Moving an existing item, or inserting one at or below the
+  current last `orderSeq`, is a reset: session subscribers get
+  `session.refetch_required`, and event recovery from before it reports
+  `snapshotRequired`. Appending after the end publishes ordinary item events.
 - `timeline.delete { sessionId, runtime, runtimeId, externalSessionId?, itemIds }`
   deletes up to 10000 item IDs. Unknown IDs are ignored, so a repeated delete
   changes nothing. A delete that removes anything is a reset, like above. A
   malformed `itemIds` list returns HTTP 400 `invalid_timeline_delete`.
+- Every ingest response of a Server that applies these semantics lists
+  `"timeline.reconcile"` in `features`. An older Server accepts the unknown
+  notification and parameter as no-ops, so a response without it means the
+  writes were not applied, for example while a deploy is rolling.
 
-The Connector sends one incremental `timeline.sync` with `orderAuthoritative`
-holding only the items whose `(orderSeq, contentHash)` differ from the
-manifest (paged like any other incremental sync), then `timeline.delete` for
-the manifest IDs the snapshot no longer has. It deletes only IDs it read from
-the manifest, so items stored after the read are kept. When nothing differs it
-still sends one unchanged item, which the Server skips but uses to resolve the
-session, so source observation time keeps moving. The end state is the same as
-a replacing snapshot, but unchanged history is never uploaded again and no
-request has to hold the whole session.
+For each complete snapshot, in order with the rest of the batch, the Connector:
+
+1. reads the manifest once the notifications before the snapshot have been
+   applied, naming the session by the snapshot's first `source.sessionId` (the
+   ID the Server would resolve the complete snapshot by);
+2. sends one incremental `timeline.sync` with `orderAuthoritative` and that
+   `externalSessionId`, holding only the items whose `(orderSeq, contentHash)`
+   differ from the manifest (a repeated ID keeps its last value), paged like any
+   other incremental sync; it is sent even when empty, since it carries source
+   observation time;
+3. only if every page was accepted, sends `timeline.delete` for the manifest IDs
+   the snapshot no longer has, naming the same session.
+
+It deletes only IDs it read from the manifest, so items stored after the read
+are kept. The end state is the same as a replacing snapshot, but unchanged
+history is never uploaded again and no request has to hold the whole session.
+A refused change leaves the session partly updated and is reported like any
+refused notification; nothing the snapshot still has is deleted. The rewritten
+notifications replace the snapshot in the pending batch, so a transient failure
+resumes at the first unaccepted page, and a change refused before the failure
+still holds back the deletes.
+
+A snapshot is reconciled only when all of its items name the same native
+session in `source.sessionId`, or none of them does; otherwise it is sent
+whole. A Server too old for `externalSessionId` resolution resolves each page
+from that page's own items, so a page of only some of them could land in
+another session.
 
 A Server without the manifest answers 404. The Connector then sends complete
-snapshots whole, as before, and asks again after 10 minutes. Other manifest
-refusals send that snapshot whole; 408, 429 and 5xx are retried later. Old
-Connectors keep sending complete snapshots, which the Server still applies as
-replacements.
+snapshots whole, as before, and asks again after 10 minutes. A reconcile write
+answered without `"timeline.reconcile"` does the same: no further page of that
+snapshot is sent, and the snapshot is sent whole right away. Other manifest
+refusals send that snapshot whole; 408, 429 and 5xx are retried later. Old Connectors keep sending complete snapshots,
+which the Server still applies as replacements. Items with equal `orderSeq`
+have no defined relative order in either path; Runtimes give each item its own.
 
-The DSH relay reads the manifest when the first page of a capture arrives,
-uploads each page's changed items before acknowledging it, and sends the
-deletes with the commit, so the commit acknowledgement does not wait for the
-history.
+The DSH relay reads the manifest within the `snapshot.begin` acknowledgement,
+naming the capture's native session. The notifications the Connector already
+queued are delivered first, under the ingest lock; the manifest pages are then
+read without it, so other sessions keep sending. It uploads each page's changed
+items before acknowledging that page, and sends the deletes with the commit.
+A page with an item that does not name the capture's native session, or any
+refusal, sends the capture as one complete snapshot at the commit instead. A
+capture once refused as too large is reconciled again when a manifest is
+available, rather than skipped.
+
+The bridge times out a whole transport batch after 60 seconds. When
+`snapshot.begin` has a batch of its own, that time covers waiting for the
+ingest lock, delivering the queued notifications and reading every manifest
+page; each later page's batch covers uploading that page's changes. When the
+bridge buffers live changes, `snapshot.begin`, pages and even the commit can
+share one batch, and so one timeout. There is no overall budget for the
+manifest read; a manifest that takes longer than one batch timeout fails the
+feed, which subscribes again. Splitting acknowledgements per operation would
+not remove that limit on its own.
 
 The target semantic connector notification methods are:
 
