@@ -7,7 +7,7 @@ import { join } from 'node:path'
 import type { AttachmentStore } from '@deepseek-ai/dsh-attachment'
 import { RuntimeServer } from '../../src/host/dsh-runtime/server.js'
 import { RuntimeAttachments } from '../../src/host/dsh-runtime/attachments.js'
-import { acquireManagerLock } from '../../src/host/storage/files.js'
+import { holdOlderPluginLease } from '../helpers/older-plugin-lease.js'
 
 const reader = { query: { listSessions: async () => [], readTitleSnapshots: async () => [], readSession: async () => { throw new Error('unused') } }, status: () => undefined }
 const gone = async (path: string) => { await assert.rejects(stat(path), { code: 'ENOENT' }) }
@@ -43,22 +43,14 @@ test('closing leaves a legacy copy that another owner has since published', asyn
 })
 
 test('a plugin before 2.0.3 that still owns the legacy path keeps it, and startup still succeeds', async t => {
-  // The lease port is derived from the directory; Windows may reserve it (EACCES), so pick another.
-  let fixture: Awaited<ReturnType<typeof paths>> | undefined, releaseOld: (() => Promise<void>) | undefined
-  for (let attempt = 0; !releaseOld && attempt < 8; attempt++) {
-    if (fixture) await rm(fixture.home, { recursive: true, force: true })
-    fixture = await paths('bridge-legacy-owned-')
-    releaseOld = await acquireManagerLock(fixture.legacy).catch((error: NodeJS.ErrnoException) => {
-      if (error.code === 'EACCES') return undefined
-      throw error
-    })
-  }
-  assert.ok(fixture && releaseOld, 'no usable lease port')
-  const { home, endpoint: file, legacy } = fixture
+  const { home, endpoint: file, legacy } = await paths('bridge-legacy-owned-')
+  t.after(() => rm(home, { recursive: true, force: true }))
+  const releaseOld = await holdOlderPluginLease(legacy)
+  if (!releaseOld) { t.skip('this machine cannot bind the older plugin\'s lease port'); return }
   const old = JSON.stringify({ version: 1, host: '127.0.0.1', port: 3, token: 'older-plugin', pid: 3 })
   await writeFile(legacy, old)
   const owner = new RuntimeServer(file, reader, undefined, undefined, legacy)
-  t.after(async () => { await owner.close(); await releaseOld!(); await rm(home, { recursive: true, force: true }) })
+  t.after(async () => { await owner.close(); await releaseOld() })
   const endpoint = await owner.start()
   assert.equal(JSON.parse(await readFile(file, 'utf8')).token, endpoint.token)
   assert.equal(await readFile(legacy, 'utf8'), old)

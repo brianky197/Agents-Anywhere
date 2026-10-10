@@ -4,7 +4,7 @@ import { link, mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promis
 import { createRequire } from 'node:module'
 import { createServer, type Server, type Socket } from 'node:net'
 import { dirname } from 'node:path'
-import { acquireManagerLock } from '../storage/files.js'
+import { acquireCompatibleManagerLock, acquireManagerLock } from '../storage/files.js'
 import { BridgeError, publicError } from './errors.js'
 import { RuntimeRouter, type SessionReader } from './router.js'
 import { record } from './types.js'
@@ -110,20 +110,18 @@ export class RuntimeServer {
     const path = this.legacyEndpointPath
     if (!path || path === this.endpointPath) return
     try {
-      // A plugin before 2.0.3 leases its own endpoint path the same way; leave that path to it.
-      this.releaseLegacyLease = await acquireManagerLock(path)
+      // A plugin before 2.0.3 leases its own endpoint path; another instance mirroring here leases
+      // it the same way. Leave the path to whichever holds it.
+      this.releaseLegacyLease = await acquireCompatibleManagerLock(path)
     } catch (error) {
-      // Only a held lease means such a plugin is running. A lease port the OS reserves (EACCES on
-      // Windows) could not have been taken by it either, so publish without that lease.
-      if (/另一个插件实例正在管理/.test(String(record(error).message))) {
-        this.diagnostics.log('warn', 'bridge.legacy_endpoint_skipped', {}, error)
-        return
-      }
+      // The copy is optional: without the lease it could replace a live plugin's endpoint.
+      this.diagnostics.log('warn', 'bridge.legacy_endpoint_skipped', {}, error)
+      return
     }
     const temporary = `${path}.${endpoint.token}.tmp`
     try {
       await writeFile(temporary, JSON.stringify(endpoint), { flag: 'wx', mode: 0o600 })
-      // Both leases are held, so whatever is at the path is stale and may be replaced.
+      // The path is leased, so whatever is there is stale and may be replaced.
       await rename(temporary, path)
       this.legacyPublished = true
     } catch (error) {

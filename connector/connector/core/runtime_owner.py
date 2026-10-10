@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Any
 import psutil
 
 from connector.core.json_rpc import JsonRpcError
+from connector.logging import logger
 
 if TYPE_CHECKING:
     from connector.core.config import ConnectorConfig
@@ -38,44 +39,71 @@ def runtime_path(config_path: str | Path | None = None) -> Path:
     return system_home() / ".agents-anywhere" / "connector-runtime.json"
 
 
-def state_lock_port(path: str | Path) -> int:
-    """The per-user TCP port that represents this record's cross-process mutex."""
+def state_lock_ports(path: str | Path) -> list[int]:
+    """The per-user TCP ports that represent this record's cross-process mutex, in trial order."""
     file = Path(path)
     identity = str(file.parent.resolve() / file.name)
     if sys.platform == "win32":
         identity = identity.lower()
-    digest = hashlib.sha256(f"aa-machine-state-v1\n{identity}".encode()).digest()
-    return 49152 + int.from_bytes(digest[:2], "big") % 16384
+    return _lock_ports(f"aa-machine-state-v1\n{identity}")
 
 
-def _claim_state_lock(port: int, deadline: float) -> socket.socket:
+def _lock_ports(key: str) -> list[int]:
+    # 16384-32767 lies below every default dynamic port range (Linux 32768+, Windows and macOS
+    # 49152+), so ephemeral client sockets and listen(0) servers never land on a lock port.
+    # The 16 candidates are spread evenly, far apart from the 100-port blocks Windows reserves.
+    digest = hashlib.sha256(key.encode()).digest()
+    base = int.from_bytes(digest[:2], "big") % 16384
+    return [16384 + (base + 1024 * k) % 16384 for k in range(16)]
+
+
+def _claim_state_lock(ports: list[int], deadline: float) -> socket.socket:
     """Binding alone claims the port, so a failed attempt must never reuse its socket.
 
     SO_REUSEADDR is deliberately not set on POSIX: Linux then lets a second process bind
     the same port while the owner sits between bind() and listen(), which both breaks the
     exclusion and makes the next bind() fail with EINVAL.
+
+    EADDRINUSE cannot tell another writer from an unrelated program, so it is waited on and a
+    later candidate is never tried. EACCES comes from a reserved port or another program's
+    exclusive bind on 0.0.0.0; it refuses every writer alike, so all move on to the same next
+    candidate. A lock that cannot be taken fails the transaction: without it, two Connectors
+    starting together could both pass the ownership check.
     """
     while True:
-        lease = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        try:
-            if sys.platform == "win32":
-                lease.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
-            lease.bind(("127.0.0.1", port))
-            lease.listen()
+        refused = []
+        for port in ports:
+            lease = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            try:
+                if sys.platform == "win32":
+                    lease.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+                lease.bind(("127.0.0.1", port))
+                lease.listen()
+            except OSError as exc:
+                lease.close()
+                if exc.errno == errno.EACCES:
+                    refused.append(port)
+                    continue
+                if exc.errno != errno.EADDRINUSE:
+                    raise
+                if time.monotonic() >= deadline:
+                    raise RuntimeError("The local Connector record is busy. Please retry.") from exc
+                break
+            if refused:
+                logger.info("local Connector record lock ports {} refused binding (EACCES); locked port {} instead", refused, port)
             return lease
-        except OSError as exc:
-            lease.close()
-            if exc.errno not in {errno.EADDRINUSE, errno.EACCES}:
-                raise
-            if time.monotonic() >= deadline:
-                raise RuntimeError("The local Connector record is busy. Please retry.") from exc
-            time.sleep(0.02)
+        else:
+            hint = " On Windows, check `netsh int ipv4 show excludedportrange protocol=tcp`." if sys.platform == "win32" else ""
+            raise RuntimeError(
+                f"Every lock port of the local Connector record refused binding (EACCES): {', '.join(map(str, ports))}.{hint}"
+            )
+        time.sleep(0.02)
 
 
 @contextmanager
 def state_lock(path: Path, timeout: float = 5) -> Iterator[None]:
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    lease = _claim_state_lock(state_lock_port(path), time.monotonic() + timeout)
+    lease = _claim_state_lock(state_lock_ports(path), time.monotonic() + timeout)
     try:
         yield
     finally:
@@ -148,12 +176,15 @@ def state_transaction(path: str | Path) -> Iterator[dict[str, Any]]:
     file = Path(path)
     with state_lock(file):
         state = read_state(file)
-        if state.get("legacyMachineMigrated") is True:
+        legacy = file.parent.parent / ".agentsanywhere" / "machine.json"
+        installation = legacy.parent / "desktop" / "install.json"
+        # Only a record with legacy files left to fold in needs the second lock;
+        # locking a path that does not exist would also create its directory.
+        if state.get("legacyMachineMigrated") is True or not (legacy.exists() or installation.exists()):
+            state["legacyMachineMigrated"] = True
             yield state
             _write(file, state)
             return
-        legacy = file.parent.parent / ".agentsanywhere" / "machine.json"
-        installation = legacy.parent / "desktop" / "install.json"
         with state_lock(legacy):
             machine, desktop = _json(legacy), _json(installation)
             if machine and machine.get("version") != 1:
