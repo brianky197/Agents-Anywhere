@@ -473,6 +473,26 @@ def test_an_unconfirmed_page_stops_the_step_and_replaces_at_once():
     assert server.ids() == ["b", "x", "y"]
 
 
+class RollingServer(ManifestServer):
+    """Writes after the first reach an older instance behind the same address."""
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        response = super().__call__(request)
+        if not request.url.path.endswith(MANIFEST_PATH):
+            self.features = False
+        return response
+
+
+def test_a_refused_page_then_an_unconfirmed_one_is_replaced_without_an_error():
+    server = RollingServer()
+    server.refuse_syncs = 1
+    _seed(server, [_item("a", 1), _item("b", 2)])
+    new = [_item("b", 1, size=20 * 1024), _item("x", 2, size=20 * 1024), _item("y", 3, size=20 * 1024)]
+    _run(server, [_snapshot(new)], budget=48 * 1024)
+    assert server.notes[-1]["params"]["complete"] is True
+    assert server.ids() == ["b", "x", "y"]
+
+
 def test_a_snapshot_naming_several_sessions_is_sent_whole():
     server = ManifestServer()
     other = {**_item("o", 2), "source": {"runtime": "codex", "sessionId": "another-native"}}
@@ -502,6 +522,50 @@ def test_dsh_capture_too_large_whole_is_reconciled_once_the_backend_can():
                 assert restated["method"] == "session.source.updated"
                 assert restated["params"]["availability"] == "available"
                 assert restated["params"]["observationOrigin"] == "event"
+            finally:
+                await relay.close()
+    asyncio.run(run())
+
+
+def test_dsh_capture_too_large_then_refused_while_reconciling_falls_back_and_recovers():
+    async def run():
+        server = ManifestServer()
+        server.manifest_status = 404
+        async with httpx.AsyncClient(transport=httpx.MockTransport(server)) as http:
+            client = _client(http)
+            relay = SyncRelay(Mock(), _stack(http, client=client))
+            try:
+                items = make_items(11, 5 * MIB)
+                await capture(relay, items)
+                assert relay.quarantined[SESSION].source_state["reason"] == "history_too_large"
+                server.manifest_status = None
+                client._reconcile_disabled_until = 0.0
+                server.refuse_syncs = 1  # one reconciling page is refused, once
+                await capture(relay, items)
+                assert not relay.quarantined, "the refusal no longer hides behind the old size refusal"
+                assert server.ids() == [item["id"] for item in items]
+                assert server.manifest_reads == 3, "the whole path reconciled it"
+            finally:
+                await relay.close()
+    asyncio.run(run())
+
+
+def test_dsh_capture_whose_page_is_itself_too_large_only_restates_metadata():
+    async def run():
+        server = ManifestServer(limit=4 * MIB)
+        server.manifest_status = 404
+        async with httpx.AsyncClient(transport=httpx.MockTransport(server)) as http:
+            client = _client(http)
+            relay = SyncRelay(Mock(), _stack(http, client=client))
+            try:
+                items = make_items(3, 5 * MIB)  # each item alone is over the ingress limit
+                await capture(relay, items)
+                assert relay.quarantined[SESSION].source_state["reason"] == "history_too_large"
+                server.manifest_status = None
+                client._reconcile_disabled_until = 0.0
+                await capture(relay, items)
+                assert relay.quarantined[SESSION].source_state["reason"] == "history_too_large"
+                assert server.manifest_reads == 2, "no whole upload that could only be refused again"
             finally:
                 await relay.close()
     asyncio.run(run())

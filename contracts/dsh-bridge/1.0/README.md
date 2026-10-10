@@ -147,8 +147,12 @@ with reason `history_too_large` (413) or `history_rejected`, ignores
 `session.turnEnded` until a later capture is accepted. Inventory entries,
 `session.meta.upsert` source facts and `session.getState` source observations
 for it carry the same unavailable state; an `archived` fact is still reported.
-A 413 capture cannot fit later: an unchanged one (same `throughSeq`) is not
-uploaded again, and a Connector restart retries it. Any other refusal may be
+A 413 capture fits later only when the backend can reconcile it: an unchanged
+one (same `throughSeq`) is reconciled again when the backend serves a manifest.
+Without a manifest, or when a reconcile write is itself refused as too large, it
+only restates metadata and is not uploaded again, and a Connector restart retries
+it. When reconciling it fails for another reason, the commit sends it whole and
+that outcome replaces the quarantine. Any other refusal may be
 temporary (an HTTP 200 rejection also covers server-side failures), so the
 Connector sends `runtime.sync.refresh` for that session after 30 seconds,
 doubling up to 30 minutes, and uploads the new capture even when it is

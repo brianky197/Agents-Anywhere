@@ -71,6 +71,8 @@ class _Reconcile:
     # The backend has no manifest, or a page was refused: the commit sends the
     # spooled capture as one complete timeline.sync instead.
     failed: bool = False
+    # Why a reconcile write was refused, when one was.
+    error: Exception | None = None
 
 
 @dataclass
@@ -86,6 +88,11 @@ class _Quarantine:
     host_fact: bool = False
     # That fact as reported, with its own observation time.
     host_source: dict[str, Any] | None = None
+
+
+def _too_large(error: Exception | None) -> bool:
+    return isinstance(error, ConnectorIngestSizeError) or (
+        isinstance(error, httpx.HTTPStatusError) and error.response.status_code == 413)
 
 
 def _checkpoint(value: Any) -> dict[str, Any] | None:
@@ -257,7 +264,8 @@ class SyncRelay:
         ``source.sessionId``; every reconcile write names it too.
         """
         # A capture refused as too large is tried again here: reconciled, it
-        # may fit. Without a manifest, the commit only restates metadata.
+        # may fit. Without a manifest, or when a reconcile write is itself too
+        # large, the commit only restates metadata.
         external = snapshot["meta"].get("externalSessionId")
         external = external if isinstance(external, str) and external else None
         manifest = await self.host.read_timeline_manifest(
@@ -270,7 +278,7 @@ class SyncRelay:
             await self.host.publish_runtime_notifications(
                 "dsh", [self.quarantined_meta(self.meta_notice(session_id, snapshot))])
         except _SESSION_INGEST_ERRORS as error:
-            self.reconcile.failed = True
+            self.reconcile.failed, self.reconcile.error = True, error
             logger.info("DSH snapshot metadata refused; the commit sends it whole error={}", error)
 
     async def reconcile_page(self, session_id: str, items: list[dict[str, Any]]) -> None:
@@ -294,7 +302,7 @@ class SyncRelay:
                 "complete": False, "orderAuthoritative": True, "items": changed}}])
         except _SESSION_INGEST_ERRORS as error:
             # A network failure still fails the feed, as for any history.
-            reconcile.failed = True
+            reconcile.failed, reconcile.error = True, error
             logger.info("DSH snapshot page refused; the commit sends it whole error={}", error)
 
     async def commit_reconcile(self, session_id: str, meta_notice: dict[str, Any]) -> bool:
@@ -309,6 +317,7 @@ class SyncRelay:
                 *delete_notifications({"sessionId": session_id}, reconcile.external_session_id, removed),
             ])
         except _SESSION_INGEST_ERRORS as error:
+            reconcile.error = error
             logger.info("DSH snapshot commit refused; sending it whole error={}", error)
             return False
         return True
@@ -321,7 +330,13 @@ class SyncRelay:
         meta = snapshot["meta"]
         meta_notice = self.meta_notice(session_id, snapshot)
         reconciled = await self.commit_reconcile(session_id, meta_notice)
-        rejected = None if reconciled else self.unchanged_refusal(session_id, snapshot)
+        # An unchanged capture once refused as too large is skipped only when it
+        # could not be reconciled: no manifest, or a write that was itself too
+        # large. Any other refusal while reconciling goes through the whole path,
+        # whose outcome replaces the old quarantine.
+        reconcile = self.reconcile
+        retry = reconcile is not None and reconcile.manifest is not None and not _too_large(reconcile.error)
+        rejected = None if reconciled or retry else self.unchanged_refusal(session_id, snapshot)
         if rejected is not None:
             # Same capture as the oversized one. Keep the metadata current without
             # uploading the history again or reporting the source as available.
@@ -366,8 +381,7 @@ class SyncRelay:
         is held back until a new capture is accepted. Unless the capture was
         too large, a new one is requested after a growing delay.
         """
-        too_large = isinstance(error, ConnectorIngestSizeError) or (
-            isinstance(error, httpx.HTTPStatusError) and error.response.status_code == 413)
+        too_large = _too_large(error)
         reason = "history_too_large" if too_large else "history_rejected"
         source_state = {"availability": "unavailable", "reason": reason,
                         "observedAt": _observed_now(), "observationOrigin": "event"}

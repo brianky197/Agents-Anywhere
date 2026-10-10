@@ -250,11 +250,12 @@ class ConnectorIngestClient:
         deletes after a refused change.
         """
         changes = pending[0].get("method") == "timeline.sync"
+        # The segment posted below holds only this step's notifications.
+        before = len(rejected)
         if not step.unconfirmed and (changes or not step.failed):
             count = 1 if changes else next((
                 index for index, notification in enumerate(pending)
                 if notification.get(RECONCILE_KEY) is not step), len(pending))
-            before = len(rejected)
             try:
                 await self._post_segment(client, token, pending, count, rejected, step)
             finally:
@@ -266,7 +267,10 @@ class ConnectorIngestClient:
             pending.pop(0)
         if step.unconfirmed:
             # An older Server took the writes without applying them: replace,
-            # which also overrides whatever part of the step it did apply.
+            # which also overrides whatever part of the step it did apply. The
+            # replacement supersedes this step's refused pages, so only its own
+            # outcome is reported.
+            del rejected[before:]
             pending.insert(0, step.original)
 
     async def _post_segment(
