@@ -198,6 +198,7 @@ class TimelineRepositoryMixin:
         items: list[TimelineItemIn],
         source_observed_at: str | None = None,
         mark_read_on_change: bool = False,
+        authoritative_order: bool = False,
     ) -> TimelineBatchWriteResult:
         """Apply a Runtime-owned incremental timeline batch by stable item ID.
 
@@ -205,6 +206,11 @@ class TimelineRepositoryMixin:
         - updates source observation time when supplied
         - inserts or updates only IDs present in this batch
         - reserves one consecutive session revision per changed item
+
+        With ``authoritative_order`` the Runtime's ``orderSeq`` is stored as
+        given, also for existing items and below the current end. Moving an
+        item or inserting one before the end is a reset: readers refetch, and
+        clients that recover from before it get a fresh snapshot.
         """
 
         incoming_by_id = latest_timeline_items_by_id(items)
@@ -219,6 +225,7 @@ class TimelineRepositoryMixin:
                 for item_id, item in incoming_by_id.items()
                 if (existing := current_by_id.get(item_id)) is None
                 or not timeline_item_state_is_unchanged(existing, item)
+                or (authoritative_order and existing.orderSeq != item.orderSeq)
             ]
             if not changed_inputs:
                 await self._update_source_observed_at(
@@ -242,9 +249,17 @@ class TimelineRepositoryMixin:
                     count=len(changed_inputs),
                     mark_read=mark_read_on_change,
                 )
+                reset = authoritative_order and any(
+                    existing.orderSeq != item.orderSeq
+                    if (existing := current_by_id.get(item.id)) is not None
+                    else item.orderSeq <= max_order_seq
+                    for item in changed_inputs
+                )
                 for index, item in enumerate(changed_inputs):
                     existing = current_by_id.get(item.id)
-                    if existing is not None:
+                    if authoritative_order:
+                        order_seq = item.orderSeq
+                    elif existing is not None:
                         order_seq = existing.orderSeq
                     elif item.orderSeq > max_order_seq:
                         order_seq = item.orderSeq
@@ -261,10 +276,49 @@ class TimelineRepositoryMixin:
                     )
                     changed_items.append(normalized)
                 await self.timeline.upsert_many(conn, changed_items)
+                if reset:
+                    await conn.execute(
+                        update(sessions_t)
+                        .where(sessions_t.c.id == session_id)
+                        .values(timeline_reset_seq=changed_items[-1].updatedSeq)
+                    )
         return TimelineBatchWriteResult(
             items=tuple(changed_items),
             changed=True,
+            reset=reset,
         )
+
+    @session_revision_fenced
+    async def delete_timeline_items(
+        self,
+        *,
+        session_id: str,
+        item_ids: list[str],
+        mark_read_on_change: bool = False,
+    ) -> TimelineBatchWriteResult:
+        """Delete the given stable IDs, as a Runtime that no longer has them says.
+
+        Unknown IDs are ignored, so a repeated delete changes nothing. A delete
+        that removes anything is a reset, like a replacing snapshot.
+        """
+
+        async with self._timeline_lock(session_id):
+            existing = await self.timeline.existing_ids(session_id, set(item_ids))
+            if not existing:
+                return TimelineBatchWriteResult(items=(), changed=False)
+            async with self._engine.begin() as conn:
+                updated_seq = await self._bump_session(
+                    conn,
+                    session_id,
+                    mark_read=mark_read_on_change,
+                )
+                await conn.execute(
+                    update(sessions_t)
+                    .where(sessions_t.c.id == session_id)
+                    .values(timeline_reset_seq=updated_seq)
+                )
+                await self.timeline.delete_items(conn, session_id, existing)
+        return TimelineBatchWriteResult(items=(), changed=True, reset=True)
 
     @session_revision_fenced
     async def replace_timeline_snapshot(

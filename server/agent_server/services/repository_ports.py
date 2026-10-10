@@ -145,6 +145,14 @@ class SessionStateRepository(SessionLookupRepository, Protocol):
 class TimelineReader(Protocol):
     async def read(self, session_id: str) -> list[TimelineItem]: ...
 
+    async def manifest(
+        self,
+        session_id: str,
+        *,
+        after: tuple[int, str] | None,
+        limit: int,
+    ) -> list[tuple[str, int, str]]: ...
+
 
 class TimelineBufferReader(Protocol):
     async def read(self, session_id: str) -> list[TimelineItem]: ...
@@ -321,6 +329,15 @@ class ConnectorNotificationRepository(
         session_id: str,
         items: list[TimelineItemIn],
         source_observed_at: str | None = None,
+        mark_read_on_change: bool = False,
+        authoritative_order: bool = False,
+    ) -> TimelineBatchWriteResult: ...
+
+    async def delete_timeline_items(
+        self,
+        *,
+        session_id: str,
+        item_ids: list[str],
         mark_read_on_change: bool = False,
     ) -> TimelineBatchWriteResult: ...
 

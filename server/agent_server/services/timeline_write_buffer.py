@@ -517,6 +517,9 @@ class TimelineWriteBuffer:
             envelope["session"] = session.model_dump(mode="json")
         elif isinstance(result, TimelineItemWriteResult):
             envelope["items"] = [result.item.model_dump(mode="json")]
+        elif isinstance(result, TimelineBatchWriteResult) and result.reset:
+            # Removed or moved rows cannot be expressed as item updates.
+            envelope["refetch"] = True
         elif isinstance(result, TimelineBatchWriteResult):
             result_items = list(result.items)
             needs_refetch = False

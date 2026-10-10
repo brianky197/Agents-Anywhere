@@ -650,6 +650,34 @@ class ConnectorIngestResponse(BaseModel):
     serverTime: str
 
 
+class ConnectorTimelineManifestCursor(BaseModel):
+    orderSeq: int
+    id: str
+
+
+class ConnectorTimelineManifestRequest(BaseModel):
+    """Which session's stored timeline a Connector wants to compare."""
+
+    sessionId: str = Field(min_length=1)
+    externalSessionId: str | None = None
+    runtime: str | None = None
+    runtimeId: str | None = None
+    after: ConnectorTimelineManifestCursor | None = None
+    limit: int = Field(default=1000, ge=1, le=5000)
+
+
+class ConnectorTimelineManifestItem(BaseModel):
+    id: str
+    orderSeq: int
+    contentHash: str
+
+
+class ConnectorTimelineManifestResponse(BaseModel):
+    items: list[ConnectorTimelineManifestItem] = Field(default_factory=list)
+    # Present while more items follow; pass it back as ``after``.
+    next: ConnectorTimelineManifestCursor | None = None
+
+
 class ConnectorConfigBundle(BaseModel):
     serverUrl: str
     connectorId: str

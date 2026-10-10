@@ -11,6 +11,10 @@ from agent_server.core.catalogs import (
     validate_permission_catalog,
 )
 from agent_server.core.models import (
+    ConnectorTimelineManifestCursor,
+    ConnectorTimelineManifestItem,
+    ConnectorTimelineManifestRequest,
+    ConnectorTimelineManifestResponse,
     NoticeIn,
     SessionStatus,
     SessionView,
@@ -30,6 +34,7 @@ from agent_server.services.repository_ports import ConnectorNotificationReposito
 from agent_server.services.timeline_write_buffer import TimelineWriteBuffer
 
 TIMELINE_SYNC_PUSH_LIMIT = 100
+TIMELINE_DELETE_LIMIT = 10_000
 SESSION_INVENTORY_LIMIT = 10_000
 SESSION_SOURCE_STATES = {
     "available",
@@ -747,7 +752,7 @@ class SessionTurnEndedNotificationHandler:
 
 
 class TimelineNotificationHandler:
-    METHODS: ClassVar[set[str]] = {"timeline.sync", "timeline.itemUpsert"}
+    METHODS: ClassVar[set[str]] = {"timeline.sync", "timeline.itemUpsert", "timeline.delete"}
 
     def __init__(
         self,
@@ -768,6 +773,8 @@ class TimelineNotificationHandler:
             return None
         if method == "timeline.sync":
             return await self._sync(connector_id, params)
+        if method == "timeline.delete":
+            return await self._delete(connector_id, params)
         return await self._upsert(connector_id, params)
 
     async def _sync(
@@ -795,6 +802,9 @@ class TimelineNotificationHandler:
             return IngestEffect()
         items = [_timeline_item_for_session(item, session_id) for item in items]
         replace_snapshot = params.get("complete") is True
+        # A Connector reconciling against the manifest sends only what changed,
+        # so the Runtime's order applies to existing items too.
+        authoritative_order = not replace_snapshot and params.get("orderAuthoritative") is True
         try:
             if self._timeline_write_buffer is None:
                 if replace_snapshot:
@@ -810,6 +820,7 @@ class TimelineNotificationHandler:
                         source_observed_at=params.get("sourceObservedAt"),
                         items=items,
                         mark_read_on_change=True,
+                        authoritative_order=authoritative_order,
                     )
             else:
                 async with self._timeline_write_buffer.session_fence(session_id):
@@ -826,12 +837,13 @@ class TimelineNotificationHandler:
                             source_observed_at=params.get("sourceObservedAt"),
                             items=items,
                             mark_read_on_change=True,
+                            authoritative_order=authoritative_order,
                         )
         finally:
             if self._timeline_write_buffer is not None:
                 await self._timeline_write_buffer.invalidate(session_id)
         changed_items = list(result.items) if result.changed else []
-        push_items = len(changed_items) <= TIMELINE_SYNC_PUSH_LIMIT
+        push_items = len(changed_items) <= TIMELINE_SYNC_PUSH_LIMIT and not result.reset
         timeline_published = result.changed and self._timeline_write_buffer is not None
         return IngestEffect(
             session_id=session_id,
@@ -840,6 +852,68 @@ class TimelineNotificationHandler:
             else None,
             timeline_reset=replace_snapshot and result.changed and push_items,
             needs_refetch=not push_items,
+            accepted_sequence=(
+                await self._store.get_session_seq(session_id)
+                if timeline_published
+                else None
+            ),
+            timeline_published=timeline_published,
+            dashboard_changed=result.changed,
+        )
+
+    async def _delete(
+        self,
+        connector_id: str,
+        params: dict[str, Any],
+    ) -> IngestEffect:
+        """Delete items a Runtime no longer has, found by comparing the manifest."""
+
+        item_ids = params.get("itemIds")
+        if (
+            not isinstance(item_ids, list)
+            or not item_ids
+            or len(item_ids) > TIMELINE_DELETE_LIMIT
+            or not all(isinstance(item_id, str) and item_id for item_id in item_ids)
+        ):
+            raise NotificationValidationError(
+                "invalid_timeline_delete",
+                f"itemIds must hold 1-{TIMELINE_DELETE_LIMIT} item IDs",
+            )
+        runtime, runtime_id = await timeline_runtime_identity_from_params(
+            self._store,
+            params,
+        )
+        session_id = await _resolve_timeline_session_id_by_external(
+            self._store,
+            connector_id,
+            params["sessionId"],
+            _string_or_none(params.get("externalSessionId")),
+            runtime=runtime,
+            runtime_id=runtime_id,
+        )
+        if await _session_disabled(self._store, session_id):
+            return IngestEffect()
+        try:
+            if self._timeline_write_buffer is None:
+                result = await self._store.delete_timeline_items(
+                    session_id=session_id,
+                    item_ids=item_ids,
+                    mark_read_on_change=True,
+                )
+            else:
+                async with self._timeline_write_buffer.session_fence(session_id):
+                    result = await self._store.delete_timeline_items(
+                        session_id=session_id,
+                        item_ids=item_ids,
+                        mark_read_on_change=True,
+                    )
+        finally:
+            if self._timeline_write_buffer is not None:
+                await self._timeline_write_buffer.invalidate(session_id)
+        timeline_published = result.changed and self._timeline_write_buffer is not None
+        return IngestEffect(
+            session_id=session_id,
+            needs_refetch=result.changed,
             accepted_sequence=(
                 await self._store.get_session_seq(session_id)
                 if timeline_published
@@ -1234,6 +1308,46 @@ async def _resolve_timeline_session_id_by_external(
             runtime_id=runtime_id,
         )
         return session_id
+
+
+async def read_connector_timeline_manifest(
+    store: ConnectorNotificationRepository,
+    *,
+    connector_id: str,
+    request: ConnectorTimelineManifestRequest,
+) -> ConnectorTimelineManifestResponse:
+    """One page of a session's stored timeline, as a Connector compares it.
+
+    The session is resolved exactly like ``timeline.sync`` resolves it. A
+    session the Server does not have yet has an empty manifest.
+    """
+
+    params = request.model_dump(exclude_none=True, exclude={"after", "limit"})
+    runtime, runtime_id = await timeline_runtime_identity_from_params(store, params)
+    session_id = await _resolve_timeline_session_id_by_external(
+        store,
+        connector_id,
+        request.sessionId,
+        request.externalSessionId,
+        runtime=runtime,
+        runtime_id=runtime_id,
+    )
+    if await _session_disabled(store, session_id):
+        return ConnectorTimelineManifestResponse()
+    after = (request.after.orderSeq, request.after.id) if request.after else None
+    rows = await store.timeline.manifest(session_id, after=after, limit=request.limit + 1)
+    page = rows[: request.limit]
+    return ConnectorTimelineManifestResponse(
+        items=[
+            ConnectorTimelineManifestItem(id=item_id, orderSeq=order_seq, contentHash=content_hash)
+            for item_id, order_seq, content_hash in page
+        ],
+        next=(
+            ConnectorTimelineManifestCursor(orderSeq=page[-1][1], id=page[-1][0])
+            if len(rows) > request.limit
+            else None
+        ),
+    )
 
 
 def _timeline_item_type(value: Any) -> str | None:

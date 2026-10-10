@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from sqlalchemy import delete, insert, select
+from sqlalchemy import and_, delete, insert, or_, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
@@ -73,6 +73,66 @@ class SqlTimelineStore:
                     timeline_items.c.id.in_(ids[offset : offset + 500]),
                 )
             )
+
+    async def existing_ids(self, session_id: str, item_ids: set[str]) -> set[str]:
+        """Return which of ``item_ids`` are stored, without reading payloads."""
+
+        found: set[str] = set()
+        ids = list(item_ids)
+        async with self._engine.connect() as conn:
+            for offset in range(0, len(ids), 500):
+                found.update(
+                    (
+                        await conn.execute(
+                            select(timeline_items.c.id).where(
+                                timeline_items.c.session_id == session_id,
+                                timeline_items.c.id.in_(ids[offset : offset + 500]),
+                            )
+                        )
+                    ).scalars()
+                )
+        return found
+
+    async def manifest(
+        self,
+        session_id: str,
+        *,
+        after: tuple[int, str] | None,
+        limit: int,
+    ) -> list[tuple[str, int, str]]:
+        """Page ``(id, orderSeq, contentHash)`` in ``(orderSeq, id)`` order.
+
+        A Connector compares this with a complete Runtime snapshot, so it can
+        upload only what changed and delete only what it has seen.
+        """
+
+        query = (
+            select(
+                timeline_items.c.id,
+                timeline_items.c.order_seq,
+                timeline_items.c.payload_json,
+            )
+            .where(timeline_items.c.session_id == session_id)
+            .order_by(timeline_items.c.order_seq, timeline_items.c.id)
+            .limit(limit)
+        )
+        if after is not None:
+            order_seq, item_id = after
+            query = query.where(
+                or_(
+                    timeline_items.c.order_seq > order_seq,
+                    and_(
+                        timeline_items.c.order_seq == order_seq,
+                        timeline_items.c.id > item_id,
+                    ),
+                )
+            )
+        async with self._engine.connect() as conn:
+            rows = (await conn.execute(query)).all()
+        return [
+            (row.id, int(row.order_seq), str(json.loads(row.payload_json).get("contentHash") or ""))
+            for row in rows
+        ]
 
     async def replace_all(
         self,

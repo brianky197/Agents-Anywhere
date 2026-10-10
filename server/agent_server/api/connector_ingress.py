@@ -32,7 +32,10 @@ from agent_server.core.models import (
     ConnectorAuthResponse,
     ConnectorIngestRequest,
     ConnectorIngestResponse,
+    ConnectorTimelineManifestRequest,
+    ConnectorTimelineManifestResponse,
 )
+from agent_server.core.runtime_identity import RuntimeIdentityError
 from agent_server.deps import (
     get_attachment_service,
     get_connector_ingest_service,
@@ -57,6 +60,7 @@ from agent_server.services.connector_ingest import ConnectorIngestService
 from agent_server.services.connector_notifications import (
     ConnectorNotificationService,
     NotificationValidationError,
+    read_connector_timeline_manifest,
 )
 from agent_server.services.connector_realtime import ConnectorRealtimeService
 from agent_server.services.dashboard_events import publish_dashboard_changed
@@ -444,6 +448,49 @@ async def connector_ingest(
                 status_code=400,
                 detail={"code": exc.code, "message": exc.message},
             ) from exc
+
+
+@router.post(
+    "/connector/timeline/manifest",
+    response_model=ConnectorTimelineManifestResponse,
+)
+async def connector_timeline_manifest(
+    payload: ConnectorTimelineManifestRequest,
+    authorization: str = Header(..., alias="Authorization"),
+    db: Store = Depends(get_store),
+) -> ConnectorTimelineManifestResponse:
+    """Page a session's stored timeline so a complete snapshot can be diffed.
+
+    A Connector uploads only the items that differ and deletes only the IDs it
+    saw here, instead of replacing the whole timeline in one request (#278).
+    A Server without this route answers 404, and the Connector then sends the
+    complete snapshot as before.
+    """
+
+    connector_id = _access_token_connector_id(authorization)
+    await _require_active_connector(authorization, db)
+    unconfigured = await db.get_unconfigured_runtime_ids(connector_id)
+    params = payload.model_dump(exclude_none=True)
+    if not runtime_notification_is_allowed("timeline.manifest", params, unconfigured):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "runtime_not_configured",
+                "message": "runtime must be configured before reading its timeline",
+            },
+        )
+    try:
+        return await read_connector_timeline_manifest(
+            db,
+            connector_id=connector_id,
+            request=payload,
+        )
+    except (NotificationValidationError, RuntimeIdentityError) as exc:
+        code = getattr(exc, "code", "invalid_runtime_identity")
+        raise HTTPException(
+            status_code=400,
+            detail={"code": code, "message": str(exc)},
+        ) from exc
 
 
 @router.get("/connector/sessions/{session_id}/attachments/{file_id}/content")

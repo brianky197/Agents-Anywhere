@@ -15,6 +15,9 @@ class TimelineItemWriteResult:
 class TimelineBatchWriteResult:
     items: tuple[TimelineItem, ...]
     changed: bool
+    # Stored items were removed or moved, so readers must refetch rather than
+    # apply ``items`` as updates.
+    reset: bool = False
 
 
 def timeline_item_state_is_unchanged(
