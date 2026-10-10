@@ -18,7 +18,8 @@ test('a busy local bridge keeps the management gateway available and can restart
   let fixture: Awaited<ReturnType<typeof nativeRuntime>> | undefined
   try {
     fixture = await nativeRuntime(home)
-    for (let i = 0; i < 100 && !fixture.ctx.get('agentsAnywhereOnboarding'); i++) await delay(5)
+    // The bridge is busy only once the runtime's first start has failed on the held lease.
+    for (let i = 0; i < 400 && !(fixture.ctx.get('agentsAnywhereOnboarding') && fixture.ctx.get('agentsAnywhereRuntime')); i++) await delay(5)
     const gateway = fixture.ctx.typertGateway
     const invoke = (method: string) => gateway.invoke({ namespace: 'agentsAnywhereOnboarding', method, args: {} })
     const snapshot = await invoke('inspect') as OnboardingSnapshot
