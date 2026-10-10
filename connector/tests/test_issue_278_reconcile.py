@@ -50,6 +50,7 @@ class ManifestServer:
         self.manifest_status: int | None = None
         self.offline_after_syncs: int | None = None
         self.refuse_syncs = 0
+        self.refuse_meta = 0
         self.syncs = 0
         # False: an older Server behind the same address takes the writes.
         self.features = True
@@ -84,6 +85,11 @@ class ManifestServer:
         rejected = []
         for index, note in enumerate(notes):
             params = note["params"]
+            if note["method"] == "session.meta.upsert" and self.refuse_meta:
+                self.refuse_meta -= 1
+                rejected.append({"index": index, "method": note["method"], "code": "notification_failed",
+                                 "message": "refused"})
+                continue
             if note["method"] == "timeline.sync" and params.get("items") and self.refuse_syncs:
                 self.refuse_syncs -= 1
                 rejected.append({"index": index, "method": note["method"], "code": "notification_failed",
@@ -566,6 +572,29 @@ def test_dsh_capture_whose_page_is_itself_too_large_only_restates_metadata():
                 await capture(relay, items)
                 assert relay.quarantined[SESSION].source_state["reason"] == "history_too_large"
                 assert server.manifest_reads == 2, "no whole upload that could only be refused again"
+            finally:
+                await relay.close()
+    asyncio.run(run())
+
+
+def test_dsh_refused_metadata_does_not_upload_a_history_already_refused_as_too_large():
+    async def run():
+        server = ManifestServer(limit=4 * MIB)
+        server.manifest_status = 404
+        async with httpx.AsyncClient(transport=httpx.MockTransport(server)) as http:
+            client = _client(http)
+            relay = SyncRelay(Mock(), _stack(http, client=client))
+            try:
+                items = make_items(3, 5 * MIB)
+                await capture(relay, items)
+                assert relay.quarantined[SESSION].source_state["reason"] == "history_too_large"
+                server.manifest_status = None
+                client._reconcile_disabled_until = 0.0
+                server.refuse_meta = 1_000_000  # the backend keeps refusing the session's metadata
+                refused_as_too_large = server.statuses.count(413)
+                await capture(relay, items)
+                assert server.statuses.count(413) == refused_as_too_large, "no history upload behind refused metadata"
+                assert not [note for note in server.notes if note["method"] == "timeline.sync"]
             finally:
                 await relay.close()
     asyncio.run(run())

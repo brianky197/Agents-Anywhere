@@ -344,8 +344,9 @@ another session.
 
 A Server without the manifest answers 404. The Connector then sends complete
 snapshots whole, as before, and asks again after 10 minutes. A reconcile write
-answered without `"timeline.reconcile"` does the same: no further page of that
-snapshot is sent, and the snapshot is sent whole right away. Other manifest
+that is accepted but answered without `"timeline.reconcile"` does the same: no
+further page of that snapshot is sent, and the snapshot is sent whole right away.
+A refused reconcile write is reported as refused, and its deletes are not sent. Other manifest
 refusals send that snapshot whole; 408, 429 and 5xx are retried later. Old Connectors keep sending complete snapshots,
 which the Server still applies as replacements. Items with equal `orderSeq`
 have no defined relative order in either path; Runtimes give each item its own.

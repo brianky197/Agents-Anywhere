@@ -143,7 +143,8 @@ def test_issue278_legacy_complete_snapshot_over_50_mib_receives_413():
             relay = SyncRelay(Mock(), host)
             try:
                 await capture(relay, make_items(11, 5 * MIB))
-                assert gateway.statuses[0] == 413 and gateway.sizes[0] > 50 * MIB
+                # The metadata goes first and alone; the whole history follows.
+                assert gateway.statuses[:2] == [200, 413] and gateway.sizes[1] > 50 * MIB
                 assert await host.sync_state_read(CHECKPOINT_KEY) is None
                 # Even through the old single request, the 413 isolates only
                 # this session as too large instead of failing the whole feed.

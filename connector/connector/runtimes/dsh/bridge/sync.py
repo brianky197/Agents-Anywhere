@@ -344,12 +344,15 @@ class SyncRelay:
             await self.host.publish_runtime_notifications("dsh", [meta_notice])
             return
         if not reconciled:
-            items = await self.load_items()
             try:
+                # The metadata goes alone and first: while it is refused the history
+                # is not uploaded, and a refusal of the history (413 in particular)
+                # is not reported as the metadata's.
+                await self.host.publish_runtime_notifications("dsh", [meta_notice])
                 # Reuse the existing complete snapshot API only after every page is
                 # received. The ingest client reconciles it against the manifest too.
+                items = await self.load_items()
                 await self.host.publish_runtime_notifications("dsh", [
-                    meta_notice,
                     {"method": "timeline.sync", "params": {"sessionId": session_id,
                         "externalSessionId": meta["externalSessionId"], "items": items, "complete": True}},
                 ])

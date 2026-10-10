@@ -49,13 +49,15 @@ def test_snapshot_replacement_waits_for_complete_capture_and_preserves_empty_sna
             receiver.publish_runtime_notifications.assert_not_awaited()
             await relay.operation(operation("snapshot.items", items=[item("two")]))
             await relay.operation(operation("snapshot.commit", totalItems=2, throughSeq=12))
-            notices = receiver.publish_runtime_notifications.call_args.args[1]
+            # The metadata goes first and alone, then the complete snapshot.
+            calls = receiver.publish_runtime_notifications.call_args_list[-2:]
+            notices = [notice for call in calls for notice in call.args[1]]
             assert [n["method"] for n in notices] == ["session.meta.upsert", "timeline.sync"]
             assert notices[1]["params"]["complete"] is True
             assert [i["id"] for i in notices[1]["params"]["items"]] == ["one", "two"]
             await relay.operation(operation("snapshot.begin", throughSeq=0, meta={"externalSessionId": "native"}))
             await relay.operation(operation("snapshot.commit", totalItems=0, throughSeq=0))
-            assert receiver.publish_runtime_notifications.call_args.args[1][1]["params"]["items"] == []
+            assert receiver.publish_runtime_notifications.call_args.args[1][0]["params"]["items"] == []
         finally:
             await relay.close()
     asyncio.run(exercise())

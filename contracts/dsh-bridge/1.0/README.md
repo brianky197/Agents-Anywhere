@@ -125,9 +125,11 @@ capture does not have, only if every page was accepted. No request holds the who
 the commit acknowledgement waits only for those small requests. Items uploaded
 before an abort stay, since they are current items of the session; nothing is
 deleted and no checkpoint is saved until a commit. If the backend has no
-manifest or refuses a page, the commit sends the spooled capture as one complete
-`timeline.sync`, which the ingest client reconciles again when it can. The
-bridge protocol is unchanged.
+manifest or refuses a page, the commit sends the capture's `session.meta.upsert`
+alone, then the spooled capture as one complete `timeline.sync`, which the ingest
+client reconciles again when it can. While the metadata is refused the history is
+not uploaded, and a refusal of the history is never reported as the metadata's.
+The bridge protocol is unchanged.
 
 `notifications` carries already normalized platform notifications. A Connector
 requests reliable recovery with `runtime.sync.subscribe {checkpointVersion:1}`;
