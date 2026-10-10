@@ -32,7 +32,7 @@ from connector.runtime_protocol import (
 from connector.runtimes.dsh.bridge.sync import SyncRelay
 from connector.server import ingest_reconcile
 from connector.server.errors import ConnectorNetworkError
-from connector.server.ingest import ConnectorIngestClient
+from connector.server.ingest import ConnectorIngestClient, ConnectorIngestRejectedError
 from connector.server.runtime_host import ConnectorRuntimeHost
 
 MIB = 1024 * 1024
@@ -50,7 +50,11 @@ class ManifestServer:
         self.manifest_status: int | None = None
         self.offline_after_syncs: int | None = None
         self.refuse_syncs = 0
+        self.refuse_meta = 0
         self.syncs = 0
+        # False: an older Server behind the same address takes the writes.
+        self.features = True
+        self.manifest_bodies: list[dict[str, Any]] = []
 
     def ids(self, session: str = SESSION) -> list[str]:
         items = self.timelines.get(session, {}).values()
@@ -72,10 +76,21 @@ class ManifestServer:
                 and any(note["method"] == "timeline.sync" for note in notes)):
             self.offline_after_syncs = None
             raise httpx.ConnectError("synthetic offline", request=request)
+        if any(note["method"] == "session.source.updated"
+               and note["params"].get("observationOrigin") not in {"event", "inventory", "operation"}
+               for note in notes):
+            # Like the Server, a source fact without a valid origin fails the request.
+            self.statuses.append(400)
+            return httpx.Response(400, json={"detail": {"code": "invalid_session_source_origin"}})
         rejected = []
         for index, note in enumerate(notes):
             params = note["params"]
-            if note["method"] == "timeline.sync" and self.refuse_syncs:
+            if note["method"] == "session.meta.upsert" and self.refuse_meta:
+                self.refuse_meta -= 1
+                rejected.append({"index": index, "method": note["method"], "code": "notification_failed",
+                                 "message": "refused"})
+                continue
+            if note["method"] == "timeline.sync" and params.get("items") and self.refuse_syncs:
                 self.refuse_syncs -= 1
                 rejected.append({"index": index, "method": note["method"], "code": "notification_failed",
                                  "message": "refused"})
@@ -83,25 +98,30 @@ class ManifestServer:
             self.apply(note["method"], params)
         self.statuses.append(200)
         self.notes.extend(notes)
-        return httpx.Response(200, json={"accepted": len(notes) - len(rejected), "rejected": rejected})
+        return httpx.Response(200, json={"accepted": len(notes) - len(rejected), "rejected": rejected,
+                                         **({"features": ["timeline.reconcile"]} if self.features else {})})
 
     def apply(self, method: str, params: dict[str, Any]) -> None:
         timeline = self.timelines.setdefault(params.get("sessionId"), {})
+        authoritative = params.get("orderAuthoritative") is True and self.features
         if method == "timeline.sync":
             self.syncs += 1
             if params.get("complete") is True:
                 timeline.clear()
             for item in params["items"]:
                 existing = timeline.get(item["id"])
-                if existing is not None and params.get("orderAuthoritative") is not True:
+                if existing is not None and not authoritative:
                     item = {**item, "orderSeq": existing["orderSeq"]}
                 timeline[item["id"]] = item
-        elif method == "timeline.delete":
+        elif method == "timeline.itemUpsert":
+            timeline[params["item"]["id"]] = params["item"]
+        elif method == "timeline.delete" and self.features:
             for item_id in params["itemIds"]:
                 timeline.pop(item_id, None)
 
     def manifest(self, body: dict[str, Any]) -> httpx.Response:
         self.manifest_reads += 1
+        self.manifest_bodies.append(body)
         if self.manifest_status is not None:
             return httpx.Response(self.manifest_status)
         items = sorted(self.timelines.get(body["sessionId"], {}).values(),
@@ -183,14 +203,54 @@ def test_only_changed_items_travel_and_removed_ones_are_deleted():
     assert sum(server.sizes) < 5 * MIB
 
 
-def test_unchanged_snapshot_sends_one_unchanged_item_and_no_delete():
+def test_unchanged_snapshot_sends_an_empty_sync_naming_its_session():
     server = ManifestServer()
     items = [_item(name, index + 1, size=MIB) for index, name in enumerate("abc")]
     _seed(server, items)
     _run(server, [_snapshot(items)])
     assert server.methods() == ["timeline.sync"]
-    assert [item["id"] for item in server.notes[0]["params"]["items"]] == ["a"]
+    params = server.notes[0]["params"]
+    assert params["items"] == [] and params["externalSessionId"] == EXTERNAL
+    assert server.manifest_bodies[0]["externalSessionId"] == EXTERNAL
     assert server.ids() == ["a", "b", "c"]
+
+
+def test_a_refused_change_is_not_followed_by_its_deletes():
+    server = ManifestServer()
+    server.refuse_syncs = 1
+    _seed(server, [_item("a", 1), _item("b", 2)])
+    with pytest.raises(ConnectorIngestRejectedError):
+        _run(server, [_snapshot([_item("x", 1)])])
+    assert "timeline.delete" not in server.methods()
+    assert server.ids() == ["a", "b"], "nothing the snapshot still has was removed, nothing half-applied"
+
+
+def test_snapshots_in_one_batch_each_read_the_timeline_the_one_before_left():
+    server = ManifestServer()
+    a, b = _item("a", 1), _item("b", 2)
+    _seed(server, [a, b])
+    live = {"method": "timeline.itemUpsert", "params": {"sessionId": SESSION, "item": _item("live", 3)}}
+    _run(server, [_snapshot([a]), _snapshot([a, b]), live, _snapshot([a, b])])
+    assert server.ids() == ["a", "b"], "as if the snapshots replaced the timeline one after another"
+    assert server.manifest_reads == 3
+
+
+def test_writes_an_older_server_took_without_applying_fall_back_to_a_replacement():
+    server = ManifestServer()
+    server.features = False
+    _seed(server, [_item("a", 1), _item("b", 2)])
+    _run(server, [_snapshot([_item("b", 1), _item("x", 2)])])
+    assert server.ids() == ["b", "x"]
+    assert server.notes[-1]["params"]["complete"] is True
+    assert "timeline.delete" not in server.methods(), "replaced right after the first unconfirmed write"
+
+
+def test_a_repeated_id_keeps_its_last_value():
+    server = ManifestServer()
+    new = _item("a", 1, text="new")
+    _seed(server, [new])
+    _run(server, [_snapshot([_item("a", 1, text="old"), new])])
+    assert server.timelines[SESSION]["a"]["content"]["text"] == "new"
 
 
 def test_empty_snapshot_deletes_everything():
@@ -206,6 +266,7 @@ def test_manifest_pages_are_followed_and_deletes_are_chunked(monkeypatch):
     _seed(server, [_item(f"o{index}", index + 1) for index in range(10)])
     _run(server, [_snapshot([_item("o0", 1)])])
     assert server.manifest_reads == 4
+    assert server.manifest_bodies[0]["limit"] == ingest_reconcile.MANIFEST_PAGE_ITEMS == 5000
     assert server.ids() == ["o0"]
     assert [len(note["params"]["itemIds"]) for note in server.notes if note["method"] == "timeline.delete"] == [
         4, 4, 1]
@@ -264,8 +325,8 @@ def test_network_failure_resumes_at_the_first_unaccepted_page_without_reading_ag
     asyncio.run(run())
 
 
-def _stack(http, budget: int = 8 * MIB):
-    client = _client(http, budget)
+def _stack(http, budget: int = 8 * MIB, client: ConnectorIngestClient | None = None):
+    client = client or _client(http, budget)
     base = ConnectorRuntimeHost("test-connector", AsyncMock(), AsyncMock(),
                                 ingest_notifications=client.ingest_notifications,
                                 timeline_manifest_reader=client.read_timeline_manifest)
@@ -305,6 +366,9 @@ def test_dsh_capture_over_the_ingress_limit_is_uploaded_while_pages_arrive():
                 assert sum(server.sizes[before_commit:]) < 64 * 1024, "the commit only restates metadata"
                 assert set(server.statuses) == {200} and max(server.sizes) <= 8 * MIB
                 assert server.methods()[0] == "session.meta.upsert", "the session exists before its items"
+                assert server.manifest_bodies[0]["externalSessionId"] == EXTERNAL
+                assert all(note["params"]["externalSessionId"] == EXTERNAL for note in server.notes
+                           if note["method"] == "timeline.sync"), "every page names the manifest's session"
                 assert not relay.quarantined
                 await relay.operation({"kind": "checkpoint.save", "externalSessionId": EXTERNAL,
                                        "checkpoint": CHECKPOINT})
@@ -331,6 +395,8 @@ def test_dsh_recapture_uploads_changes_and_deletes_what_is_gone():
                 deleted = [item_id for note in server.notes if note["method"] == "timeline.delete"
                            for item_id in note["params"]["itemIds"]]
                 assert sorted(deleted) == ["item-3", "item-4"]
+                assert all(note["params"]["externalSessionId"] == EXTERNAL for note in server.notes
+                           if note["method"] == "timeline.delete")
             finally:
                 await relay.close()
     asyncio.run(run())
@@ -348,6 +414,233 @@ def test_dsh_refused_page_falls_back_to_one_reconciled_snapshot():
                 assert server.ids() == [item["id"] for item in items]
                 assert not relay.quarantined
                 assert server.manifest_reads == 2, "the whole path reads the manifest again"
+            finally:
+                await relay.close()
+    asyncio.run(run())
+
+
+def test_dsh_capture_metadata_keeps_a_newer_host_fact_during_quarantine():
+    async def run():
+        server = ManifestServer()
+        async with httpx.AsyncClient(transport=httpx.MockTransport(server)) as http:
+            relay = SyncRelay(Mock(), _stack(http))
+            try:
+                await relay.quarantine(SESSION, EXTERNAL, 10, ConnectorIngestRejectedError("refused"))
+                for task in list(relay.retry_tasks):
+                    task.cancel()
+                # The Host reports the session archived after the refusal.
+                archived = {"availability": "archived", "reason": "archived_in_dsh",
+                            "observedAt": "2026-10-10T10:00:00Z", "observationOrigin": "event"}
+                relay.durable_checkpoints = True
+                await relay.operation({"kind": "notifications", "notifications": [{
+                    "method": "session.source.updated", "params": {"sessionId": SESSION, **archived}}]})
+                server.notes.clear()
+                await relay.operation({"kind": "snapshot.begin", "sessionId": SESSION, "snapshotId": "c",
+                                       "throughSeq": 11, "meta": {"externalSessionId": EXTERNAL,
+                                       "sourceState": {"availability": "available",
+                                                       "observedAt": "2026-10-10T09:00:00Z"}}})
+                meta = next(note for note in server.notes if note["method"] == "session.meta.upsert")
+                # The Host's own fact, as observed: the backend keeps it.
+                assert meta["params"]["sourceState"] == archived
+                assert relay.quarantined[SESSION].host_fact is True, "an older capture fact does not reset it"
+            finally:
+                await relay.close()
+    asyncio.run(run())
+
+
+def test_dsh_capture_metadata_still_reports_a_quarantine():
+    async def run():
+        server = ManifestServer()
+        async with httpx.AsyncClient(transport=httpx.MockTransport(server)) as http:
+            relay = SyncRelay(Mock(), _stack(http))
+            try:
+                await relay.quarantine(SESSION, EXTERNAL, 10, ConnectorIngestRejectedError("refused"))
+                for task in list(relay.retry_tasks):
+                    task.cancel()
+                await relay.operation({"kind": "snapshot.begin", "sessionId": SESSION, "snapshotId": "c",
+                                       "throughSeq": 11, "meta": {"externalSessionId": EXTERNAL,
+                                       "sourceState": {"availability": "available"}}})
+                meta = next(note for note in server.notes if note["method"] == "session.meta.upsert")
+                assert meta["params"]["sourceState"]["availability"] == "unavailable"
+            finally:
+                await relay.close()
+    asyncio.run(run())
+
+
+def test_an_unconfirmed_page_stops_the_step_and_replaces_at_once():
+    server = ManifestServer()
+    server.features = False
+    _seed(server, [_item("a", 1), _item("b", 2)])
+    new = [_item("b", 1, size=20 * 1024), _item("x", 2, size=20 * 1024), _item("y", 3, size=20 * 1024)]
+    _run(server, [_snapshot(new)], budget=48 * 1024)
+    reconcile_pages = [note for note in server.notes if note["params"].get("orderAuthoritative")]
+    assert len(reconcile_pages) == 1, "no page after the first unconfirmed one"
+    assert server.notes[-1]["params"]["complete"] is True
+    assert server.ids() == ["b", "x", "y"]
+
+
+class RollingServer(ManifestServer):
+    """Writes after the first reach an older instance behind the same address."""
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        response = super().__call__(request)
+        if not request.url.path.endswith(MANIFEST_PATH):
+            self.features = False
+        return response
+
+
+def test_a_refused_page_then_an_unconfirmed_one_is_replaced_without_an_error():
+    server = RollingServer()
+    server.refuse_syncs = 1
+    _seed(server, [_item("a", 1), _item("b", 2)])
+    new = [_item("b", 1, size=20 * 1024), _item("x", 2, size=20 * 1024), _item("y", 3, size=20 * 1024)]
+    _run(server, [_snapshot(new)], budget=48 * 1024)
+    assert server.notes[-1]["params"]["complete"] is True
+    assert server.ids() == ["b", "x", "y"]
+
+
+def test_a_snapshot_naming_several_sessions_is_sent_whole():
+    server = ManifestServer()
+    other = {**_item("o", 2), "source": {"runtime": "codex", "sessionId": "another-native"}}
+    _run(server, [_snapshot([_item("a", 1), other])])
+    assert server.manifest_reads == 0
+    assert server.notes[0]["params"]["complete"] is True
+
+
+def test_dsh_capture_too_large_whole_is_reconciled_once_the_backend_can():
+    async def run():
+        server = ManifestServer()
+        server.manifest_status = 404
+        async with httpx.AsyncClient(transport=httpx.MockTransport(server)) as http:
+            client = _client(http)
+            relay = SyncRelay(Mock(), _stack(http, client=client))
+            try:
+                items = make_items(11, 5 * MIB)
+                await capture(relay, items)
+                assert relay.quarantined[SESSION].source_state["reason"] == "history_too_large"
+                # The backend is upgraded and the cooldown is over.
+                server.manifest_status = None
+                client._reconcile_disabled_until = 0.0
+                await capture(relay, items)
+                assert not relay.quarantined
+                assert server.ids() == [item["id"] for item in items]
+                restated = server.notes[-1]
+                assert restated["method"] == "session.source.updated"
+                assert restated["params"]["availability"] == "available"
+                assert restated["params"]["observationOrigin"] == "event"
+            finally:
+                await relay.close()
+    asyncio.run(run())
+
+
+def test_dsh_capture_too_large_then_refused_while_reconciling_falls_back_and_recovers():
+    async def run():
+        server = ManifestServer()
+        server.manifest_status = 404
+        async with httpx.AsyncClient(transport=httpx.MockTransport(server)) as http:
+            client = _client(http)
+            relay = SyncRelay(Mock(), _stack(http, client=client))
+            try:
+                items = make_items(11, 5 * MIB)
+                await capture(relay, items)
+                assert relay.quarantined[SESSION].source_state["reason"] == "history_too_large"
+                server.manifest_status = None
+                client._reconcile_disabled_until = 0.0
+                server.refuse_syncs = 1  # one reconciling page is refused, once
+                await capture(relay, items)
+                assert not relay.quarantined, "the refusal no longer hides behind the old size refusal"
+                assert server.ids() == [item["id"] for item in items]
+                assert server.manifest_reads == 3, "the whole path reconciled it"
+            finally:
+                await relay.close()
+    asyncio.run(run())
+
+
+def test_dsh_capture_whose_page_is_itself_too_large_only_restates_metadata():
+    async def run():
+        server = ManifestServer(limit=4 * MIB)
+        server.manifest_status = 404
+        async with httpx.AsyncClient(transport=httpx.MockTransport(server)) as http:
+            client = _client(http)
+            relay = SyncRelay(Mock(), _stack(http, client=client))
+            try:
+                items = make_items(3, 5 * MIB)  # each item alone is over the ingress limit
+                await capture(relay, items)
+                assert relay.quarantined[SESSION].source_state["reason"] == "history_too_large"
+                server.manifest_status = None
+                client._reconcile_disabled_until = 0.0
+                await capture(relay, items)
+                assert relay.quarantined[SESSION].source_state["reason"] == "history_too_large"
+                assert server.manifest_reads == 2, "no whole upload that could only be refused again"
+            finally:
+                await relay.close()
+    asyncio.run(run())
+
+
+def test_dsh_refused_metadata_does_not_upload_a_history_already_refused_as_too_large():
+    async def run():
+        server = ManifestServer(limit=4 * MIB)
+        server.manifest_status = 404
+        async with httpx.AsyncClient(transport=httpx.MockTransport(server)) as http:
+            client = _client(http)
+            relay = SyncRelay(Mock(), _stack(http, client=client))
+            try:
+                items = make_items(3, 5 * MIB)
+                await capture(relay, items)
+                assert relay.quarantined[SESSION].source_state["reason"] == "history_too_large"
+                server.manifest_status = None
+                client._reconcile_disabled_until = 0.0
+                server.refuse_meta = 1_000_000  # the backend keeps refusing the session's metadata
+                refused_as_too_large = server.statuses.count(413)
+                await capture(relay, items)
+                assert server.statuses.count(413) == refused_as_too_large, "no history upload behind refused metadata"
+                assert not [note for note in server.notes if note["method"] == "timeline.sync"]
+            finally:
+                await relay.close()
+    asyncio.run(run())
+
+
+def test_dsh_manifest_waits_for_notifications_queued_before_it():
+    async def run():
+        server = ManifestServer()
+        _seed(server, _dsh_items(2, 1024))
+        async with httpx.AsyncClient(transport=httpx.MockTransport(server)) as http:
+            client = _client(http)
+            relay = SyncRelay(Mock(), _stack(http, client=client))
+            try:
+                stale = {**make_items(3, 1024)[2], "id": "queued-before"}
+                await client.enqueue("timeline.itemUpsert", {"sessionId": SESSION, "item": stale})
+                await capture(relay, _dsh_items(2, 1024))
+                assert server.ids() == ["item-0", "item-1"], "the queued item was stored first, then deleted"
+            finally:
+                await relay.close()
+    asyncio.run(run())
+
+
+def test_a_snapshot_mixing_named_and_anonymous_items_is_sent_whole():
+    server = ManifestServer()
+    anonymous = {**_item("anon", 2), "source": {"runtime": "codex"}}
+    _run(server, [_snapshot([_item("a", 1), anonymous])])
+    assert server.manifest_reads == 0
+    assert server.notes[0]["params"]["complete"] is True
+
+
+def test_dsh_page_with_an_anonymous_item_falls_back_to_the_whole_path():
+    async def run():
+        server = ManifestServer()
+        async with httpx.AsyncClient(transport=httpx.MockTransport(server)) as http:
+            relay = SyncRelay(Mock(), _stack(http))
+            try:
+                items = _dsh_items(3, 1024)
+                items[1] = {**items[1], "source": {"runtime": "dsh"}}
+                await capture(relay, items)
+                # Pages before it were reconciled; the anonymous item never is.
+                reconciled = [item["id"] for note in server.notes if note["params"].get("orderAuthoritative")
+                              for item in note["params"]["items"]]
+                assert items[1]["id"] not in reconciled
+                assert "timeline.delete" not in server.methods()
+                assert any(note["params"].get("complete") is True for note in server.notes)
+                assert server.ids() == [item["id"] for item in items]
             finally:
                 await relay.close()
     asyncio.run(run())

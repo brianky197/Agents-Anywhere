@@ -790,21 +790,34 @@ class TimelineNotificationHandler:
             params,
         )
         requested_session_id = params["sessionId"]
-        session_id = await _resolve_timeline_session_id(
-            self._store,
-            connector_id,
-            requested_session_id,
-            items,
-            runtime=runtime,
-            runtime_id=runtime_id,
-        )
-        if await _session_disabled(self._store, session_id):
-            return IngestEffect()
-        items = [_timeline_item_for_session(item, session_id) for item in items]
         replace_snapshot = params.get("complete") is True
         # A Connector reconciling against the manifest sends only what changed,
         # so the Runtime's order applies to existing items too.
         authoritative_order = not replace_snapshot and params.get("orderAuthoritative") is True
+        if authoritative_order and "externalSessionId" in params:
+            # Reconcile writes name their session explicitly, as the manifest
+            # and timeline.delete do, so a page of changed items resolves the
+            # same session whichever items it happens to hold.
+            session_id = await _resolve_timeline_session_id_by_external(
+                self._store,
+                connector_id,
+                requested_session_id,
+                _string_or_none(params.get("externalSessionId")),
+                runtime=runtime,
+                runtime_id=runtime_id,
+            )
+        else:
+            session_id = await _resolve_timeline_session_id(
+                self._store,
+                connector_id,
+                requested_session_id,
+                items,
+                runtime=runtime,
+                runtime_id=runtime_id,
+            )
+        if await _session_disabled(self._store, session_id):
+            return IngestEffect()
+        items = [_timeline_item_for_session(item, session_id) for item in items]
         try:
             if self._timeline_write_buffer is None:
                 if replace_snapshot:
@@ -1315,11 +1328,14 @@ async def read_connector_timeline_manifest(
     *,
     connector_id: str,
     request: ConnectorTimelineManifestRequest,
+    timeline_write_buffer: TimelineWriteBuffer | None = None,
 ) -> ConnectorTimelineManifestResponse:
     """One page of a session's stored timeline, as a Connector compares it.
 
-    The session is resolved exactly like ``timeline.sync`` resolves it. A
-    session the Server does not have yet has an empty manifest.
+    The session is resolved like a reconcile write with the same
+    ``externalSessionId``. A session the Server does not have yet has an empty
+    manifest. Items accepted but still buffered are made durable first, as a
+    replacing snapshot would, so they can be deleted too.
     """
 
     params = request.model_dump(exclude_none=True, exclude={"after", "limit"})
@@ -1335,7 +1351,11 @@ async def read_connector_timeline_manifest(
     if await _session_disabled(store, session_id):
         return ConnectorTimelineManifestResponse()
     after = (request.after.orderSeq, request.after.id) if request.after else None
-    rows = await store.timeline.manifest(session_id, after=after, limit=request.limit + 1)
+    if timeline_write_buffer is None:
+        rows = await store.timeline.manifest(session_id, after=after, limit=request.limit + 1)
+    else:
+        async with timeline_write_buffer.session_fence(session_id):
+            rows = await store.timeline.manifest(session_id, after=after, limit=request.limit + 1)
     page = rows[: request.limit]
     return ConnectorTimelineManifestResponse(
         items=[

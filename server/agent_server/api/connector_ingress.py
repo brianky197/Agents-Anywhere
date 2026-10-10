@@ -458,6 +458,7 @@ async def connector_timeline_manifest(
     payload: ConnectorTimelineManifestRequest,
     authorization: str = Header(..., alias="Authorization"),
     db: Store = Depends(get_store),
+    timeline_write_buffer: TimelineWriteBuffer = Depends(get_timeline_write_buffer),
 ) -> ConnectorTimelineManifestResponse:
     """Page a session's stored timeline so a complete snapshot can be diffed.
 
@@ -484,6 +485,7 @@ async def connector_timeline_manifest(
             db,
             connector_id=connector_id,
             request=payload,
+            timeline_write_buffer=timeline_write_buffer,
         )
     except (NotificationValidationError, RuntimeIdentityError) as exc:
         code = getattr(exc, "code", "invalid_runtime_identity")

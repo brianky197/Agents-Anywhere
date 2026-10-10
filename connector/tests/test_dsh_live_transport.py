@@ -158,10 +158,11 @@ def test_complete_snapshot_and_inventory_still_use_ingest_when_websocket_is_conn
                 {"method": "session.inventory.complete", "params": {"syncId": "inventory"}},
             ]})
             batches = [call.args[0] for call in client._ingest.ingest_notifications.await_args_list]
+            # The snapshot's metadata goes first and alone, then the complete snapshot.
             assert [[notice["method"] for notice in batch] for batch in batches] == [
-                ["session.inventory.begin"], ["session.meta.upsert", "timeline.sync"], ["session.inventory.complete"],
+                ["session.inventory.begin"], ["session.meta.upsert"], ["timeline.sync"], ["session.inventory.complete"],
             ]
-            assert batches[1][1]["params"]["complete"] is True
+            assert batches[2][0]["params"]["complete"] is True
             assert all(notice["params"]["runtimeId"] == "rti_dsh" for batch in batches for notice in batch)
             websocket.send.assert_not_awaited()
             client._ingest.enqueue.assert_not_awaited()
