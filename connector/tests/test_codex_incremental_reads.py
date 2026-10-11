@@ -1,6 +1,7 @@
 """Exercise native SQLite guards, RPC paging and durable Connector checkpoints."""
 import asyncio
 import copy
+import ctypes
 import hashlib
 import json
 import os
@@ -177,8 +178,8 @@ def test_stale_unowned_native_in_progress_turn_is_exposed_as_idle(tmp_path):
     asyncio.run(run())
 
 
-@pytest.mark.skipif(sys.platform != "win32", reason="Windows share-mode ownership check")
-def test_windows_rollout_held_for_writing_is_owned_without_walking_processes(
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows file-system ownership query")
+def test_windows_rollout_open_in_codex_is_owned_without_walking_processes(
     tmp_path,
     monkeypatch,
 ):
@@ -197,32 +198,49 @@ def test_windows_rollout_held_for_writing_is_owned_without_walking_processes(
         async def state():
             return await runtime.get_session_state(session.session_id, external_session_id="thread_1")
 
-        # Codex keeps its rollout open for writing while it runs a turn.
+        this_process = codex_history_index.psutil.Process().name()
         with client.path.open("ab"):
-            owned = await state()
+            # Another program holding the rollout is not Codex running the thread.
+            held_elsewhere = await state()
+            with monkeypatch.context() as patch:
+                patch.setattr(codex_history_index, "_is_codex_process", lambda info: info.get("name") == this_process)
+                owned = await state()
         released = await state()
 
         assert owned is not None and owned.status == "running"
         assert owned.metadata["native_activity_evidence"] == "owner"
-        assert released is not None and released.status == "idle"
-        assert released.metadata["native_activity_evidence"] == "stale"
+        for idle in (held_elsewhere, released):
+            assert idle is not None and idle.status == "idle"
+            assert idle.metadata["native_activity_evidence"] == "stale"
 
     asyncio.run(run())
 
 
-@pytest.mark.skipif(sys.platform != "win32", reason="Windows share-mode ownership check")
-def test_windows_ownership_check_sees_writers_only(tmp_path):
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows file-system ownership query")
+def test_windows_ownership_query_never_contends_for_the_rollout(tmp_path):
     rollout = tmp_path / "rollout.jsonl"
     rollout.write_text("{}\n")
-    has_writer = codex_history_index._windows_file_has_writer
+    using = codex_history_index._windows_processes_using_file
 
-    assert has_writer(str(rollout)) is False
+    assert using(str(rollout)) == []
+    assert using(str(tmp_path / "missing.jsonl")) == []
     with rollout.open("rb"):
-        assert has_writer(str(rollout)) is False
-    with rollout.open("ab"):
-        assert has_writer(str(rollout)) is True
-    assert has_writer(str(rollout)) is False
-    assert has_writer(str(tmp_path / "missing.jsonl")) is False
+        assert using(str(rollout)) == [os.getpid()]
+
+    # A holder that shares nothing still shows up: the query's handle reads
+    # attributes only, so it neither conflicts with nor blocks the holder.
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.restype = ctypes.c_void_p
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    exclusive = kernel32.CreateFileW(str(rollout), 0x40000000, 0, None, 3, 0, None)
+    assert exclusive not in (None, ctypes.c_void_p(-1).value)
+    try:
+        with pytest.raises(PermissionError):
+            rollout.open("rb")
+        assert using(str(rollout)) == [os.getpid()]
+    finally:
+        kernel32.CloseHandle(exclusive)
+    assert using(str(rollout)) == []
 
 
 @pytest.mark.parametrize("mutation", ["old_edit", "old_tool_edit", "delete_turn", "delete_item", "reorder", "unfinished", "invalid_checkpoint"])

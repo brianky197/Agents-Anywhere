@@ -13,7 +13,7 @@ import sys
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
-from functools import lru_cache
+from functools import cache, lru_cache
 from pathlib import Path
 from typing import Any, Literal
 
@@ -114,7 +114,9 @@ def _source_is_recent(source: Mapping[str, Any]) -> bool:
 def _source_is_open_by_codex(source: Mapping[str, Any]) -> bool:
     if sys.platform == "win32":
         path = source.get("path")
-        return isinstance(path, str) and _windows_file_has_writer(path)
+        if not isinstance(path, str):
+            return False
+        return any(_is_codex_pid(pid) for pid in _windows_processes_using_file(path))
     device = source.get("device")
     inode = source.get("inode")
     if not isinstance(device, int) or not isinstance(inode, int):
@@ -122,23 +124,71 @@ def _source_is_open_by_codex(source: Mapping[str, Any]) -> bool:
     return (device, inode) in _open_codex_file_identities(int(time.monotonic()))
 
 
-_GENERIC_READ = 0x80000000
-_FILE_SHARE_READ_DELETE = 0x1 | 0x4
+def _is_codex_pid(pid: int) -> bool:
+    try:
+        return _is_codex_process(psutil.Process(pid).as_dict(["name", "exe", "cmdline"]))
+    except psutil.Error:
+        return False
+
+
+_FILE_READ_ATTRIBUTES = 0x80
+_FILE_SHARE_ALL = 0x1 | 0x2 | 0x4
 _OPEN_EXISTING = 3
-_ERROR_SHARING_VIOLATION = 32
+_FILE_PROCESS_IDS_USING_FILE_INFORMATION = 47
+_STATUS_INFO_LENGTH_MISMATCH = 0xC0000004
+_PROCESS_IDS_BUFFER_LIMIT = 1 << 20
 
 
-def _windows_file_has_writer(path: str) -> bool:
-    """Whether some handle holds ``path`` open for writing.
+class _IoStatusBlock(ctypes.Structure):
+    _fields_ = [("status", ctypes.c_void_p), ("information", ctypes.c_size_t)]
 
-    Codex keeps a rollout open for writing for as long as it runs the thread,
-    including while a tool call leaves the file untouched. Asking Codex processes
-    for their open files instead walks every handle in the system and, on a busy
-    machine, held the GIL for over 20 seconds, so the Connector missed its
-    keepalive and the Server's requests timed out. Opening the file without
-    FILE_SHARE_WRITE answers at once: it fails while any handle can write to it.
+
+class _ProcessIdsUsingFile(ctypes.Structure):
+    _fields_ = [("count", ctypes.c_uint32), ("pids", ctypes.c_size_t * 1)]
+
+
+def _windows_processes_using_file(path: str) -> list[int]:
+    """The ids of processes that have ``path`` open, as the file system reports them.
+
+    psutil finds a process's open files by walking the system handle table and
+    asking for each handle's name while holding the GIL; on a busy machine one
+    pass took 21 s and froze the event loop past the Server's websocket
+    keepalive. Asking the file system who has this one file open avoids that:
+    the handle opened for the query reads attributes only, so it takes no part
+    in sharing checks and never stops Codex from opening its rollout, and ctypes
+    releases the GIL during both calls. One query measured about 0.1 s.
     """
 
+    create_file, close_handle, query_information_file = _windows_file_api()
+    handle = create_file(path, _FILE_READ_ATTRIBUTES, _FILE_SHARE_ALL, None, _OPEN_EXISTING, 0, None)
+    if handle is None or handle == ctypes.c_void_p(-1).value:
+        return []
+    try:
+        size = 4096
+        while size <= _PROCESS_IDS_BUFFER_LIMIT:
+            buffer = ctypes.create_string_buffer(size)
+            status = query_information_file(
+                handle,
+                ctypes.byref(_IoStatusBlock()),
+                buffer,
+                size,
+                _FILE_PROCESS_IDS_USING_FILE_INFORMATION,
+            )
+            if status == _STATUS_INFO_LENGTH_MISMATCH:
+                size *= 4
+                continue
+            if status != 0:
+                return []
+            count = _ProcessIdsUsingFile.from_buffer(buffer).count
+            pids = (ctypes.c_size_t * count).from_buffer(buffer, _ProcessIdsUsingFile.pids.offset)
+            return list(pids)
+        return []
+    finally:
+        close_handle(handle)
+
+
+@cache
+def _windows_file_api() -> tuple[Any, Any, Any]:
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     create_file = kernel32.CreateFileW
     create_file.argtypes = [
@@ -146,12 +196,15 @@ def _windows_file_has_writer(path: str) -> bool:
         ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p,
     ]
     create_file.restype = ctypes.c_void_p
-    handle = create_file(path, _GENERIC_READ, _FILE_SHARE_READ_DELETE, None, _OPEN_EXISTING, 0, None)
-    if handle is None or handle == ctypes.c_void_p(-1).value:
-        return ctypes.get_last_error() == _ERROR_SHARING_VIOLATION
-    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
-    kernel32.CloseHandle(handle)
-    return False
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = [ctypes.c_void_p]
+    query_information_file = ctypes.WinDLL("ntdll").NtQueryInformationFile
+    query_information_file.argtypes = [
+        ctypes.c_void_p, ctypes.POINTER(_IoStatusBlock), ctypes.c_void_p,
+        ctypes.c_uint32, ctypes.c_int,
+    ]
+    query_information_file.restype = ctypes.c_uint32
+    return create_file, close_handle, query_information_file
 
 
 @lru_cache(maxsize=2)
