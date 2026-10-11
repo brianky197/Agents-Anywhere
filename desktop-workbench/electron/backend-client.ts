@@ -167,11 +167,8 @@ export class DesktopBackendClient {
     this.stream = null;
     const child = this.child;
     if (!child) return;
-    try {
-      child.send({ type: "shutdown" } satisfies BackendControlMessage);
-    } catch {
-      // The channel is already gone; the exit race below handles it.
-    }
+    // A backend whose channel is already gone is left to the exit race below.
+    sendToBackend(child, { type: "shutdown" });
     const exited = await Promise.race([
       this.exitPromise?.then(() => true) ?? Promise.resolve(true),
       delay(SHUTDOWN_GRACE_MS).then(() => false),
@@ -238,20 +235,20 @@ export class DesktopBackendClient {
       const headers: Record<string, string> = {};
       response.headers.forEach((value, key) => { headers[key] = value; });
       const body = await response.text();
-      this.child?.send({
+      sendToBackend(this.child, {
         type: "netFetchResult",
         id: message.id,
         ok: response.ok,
         status: response.status,
         headers,
         body,
-      } satisfies BackendControlMessage);
+      });
     } catch (error) {
-      this.child?.send({
+      sendToBackend(this.child, {
         type: "netFetchError",
         id: message.id,
         message: error instanceof Error ? error.message : String(error),
-      } satisfies BackendControlMessage);
+      });
     }
   }
 
@@ -332,6 +329,16 @@ export class DesktopBackendClient {
     }
     return payload as T;
   }
+}
+
+/**
+ * A closed IPC channel does not make `send` throw: without a callback, Node reports it
+ * as an `error` event on the child, which nothing handles, so Main would crash with an
+ * uncaught exception. The channel closes before `exit` arrives, and a backend that went
+ * away is reported through its `exit`, so the message is simply dropped.
+ */
+function sendToBackend(child: ChildProcess | null, message: BackendControlMessage): void {
+  if (child?.connected) child.send(message, () => undefined);
 }
 
 function exitReason(code: number | null, signal: NodeJS.Signals | null): string {
