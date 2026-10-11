@@ -91,9 +91,16 @@ Use `runtime.state.updated`, `runtime.capability.updated`,
 - Server returns `snapshotRequired=true` only when durable meta/timeline
   recovery is explicitly impossible.
 - Client pulls snapshot only for initial load or `snapshotRequired=true`.
-- Runtime state and catalogs are not recovered from Server DB. After reconnect,
-  Web calls the relevant runtime live endpoint if it needs current state or
-  catalogs.
+- Recovery returns the newest runtime state Server holds (the shared runtime
+  state cache, else the persisted session status) as `runtime.state.updated`:
+  at the current cursor always, otherwise when its `updatedSeq` is newer than
+  `after`. Runtime state is only pushed live, so a transition between the
+  snapshot and the WebSocket subscription is otherwise lost and the client
+  keeps showing a finished turn as running. `session.meta.updated` from
+  recovery carries the same status. Clients keep accepting a state only when
+  its `updatedSeq` is not older than the one they hold.
+- Catalogs are not recovered from Server DB. After reconnect, Web calls the
+  relevant runtime live endpoint if it needs current catalogs.
 - Runtime notices are recovered when Server has a sequence-backed projection.
   Session meta and the latest persisted effective capability projection are
   also returned when recovery starts at the current cursor, because presence

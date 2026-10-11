@@ -113,6 +113,8 @@ from agent_server.services.effective_capabilities import (
 from agent_server.services.event_recovery import EventRecoveryService
 from agent_server.services.session_meta_projection import (
     project_session_meta_for_dashboard,
+    read_runtime_state_snapshot,
+    session_with_runtime_state,
 )
 from agent_server.services.session_run import SessionRunError, SessionRunService
 from agent_server.services.session_runtime_state_cache import SessionRuntimeStateCache
@@ -266,26 +268,6 @@ async def _publish_session_runtime_state_update(
                 "runtimeState": latest_state.model_dump(mode="json"),
             },
         )
-
-
-async def read_runtime_state_snapshot(
-    db: Store,
-    runtime_state_cache: SessionRuntimeStateCache,
-    session: SessionView,
-    user_id: str | None,
-) -> SessionRuntimeState:
-    """Read the runtime state a snapshot can serve without connector RPC.
-
-    A live read is runtime-owned work that can take seconds on a large history
-    (for example a DSH session log replay). Snapshot hydration therefore returns
-    the newest cached or persisted fact and refreshes the live state in the
-    background, where a real change is pushed to subscribers.
-    """
-
-    cached_state = await runtime_state_cache.get(session.id)
-    if cached_state is not None:
-        return cached_state
-    return await db.get_session_runtime_state(session.id, user_id=user_id)
 
 
 async def refresh_runtime_state_in_background(
@@ -1936,17 +1918,5 @@ def runtime_state_from_rpc_payload(
             "updatedSeq": session.updatedSeq,
             "createdAt": now,
             "updatedAt": now,
-        }
-    )
-
-
-def session_with_runtime_state(
-    session: SessionView,
-    state: SessionRuntimeState,
-) -> SessionView:
-    return session.model_copy(
-        update={
-            "externalSessionId": state.externalSessionId or session.externalSessionId,
-            "status": state.status,
         }
     )

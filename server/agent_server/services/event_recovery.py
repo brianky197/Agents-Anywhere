@@ -8,7 +8,7 @@ from agent_server.core.events import (
     protocol_event,
     timeline_events_from_items,
 )
-from agent_server.core.models import SessionView, TimelineItem
+from agent_server.core.models import SessionRuntimeState, SessionView, TimelineItem
 from agent_server.core.protocol import ProtocolEventRecoveryResponse
 from agent_server.core.utc import utc_now
 from agent_server.services.connector_presence import ConnectorPresencePort
@@ -16,13 +16,23 @@ from agent_server.services.effective_capabilities import (
     SessionCapabilityRepository,
     project_session_capabilities,
 )
+from agent_server.services.repository_ports import SessionRuntimeStateRepository
+from agent_server.services.session_meta_projection import (
+    read_runtime_state_snapshot,
+    session_with_runtime_state,
+)
+from agent_server.services.session_runtime_state_cache import SessionRuntimeStateCache
 from agent_server.services.timeline_write_buffer import TimelineWriteBuffer
 
 DEFAULT_RECOVERY_LIMIT = 500
 DEFAULT_STABILITY_ATTEMPTS = 3
 
 
-class EventRecoveryRepository(SessionCapabilityRepository, Protocol):
+class EventRecoveryRepository(
+    SessionCapabilityRepository,
+    SessionRuntimeStateRepository,
+    Protocol,
+):
     async def get_session(
         self,
         session_id: str,
@@ -48,12 +58,14 @@ class EventRecoveryService:
         presence: ConnectorPresencePort,
         timeline_write_buffer: TimelineWriteBuffer | None = None,
         *,
+        runtime_state_cache: SessionRuntimeStateCache | None = None,
         limit: int = DEFAULT_RECOVERY_LIMIT,
         stability_attempts: int = DEFAULT_STABILITY_ATTEMPTS,
     ) -> None:
         self._store = store
         self._presence = presence
         self._timeline_write_buffer = timeline_write_buffer
+        self._runtime_state_cache = runtime_state_cache
         self._limit = limit
         self._stability_attempts = stability_attempts
 
@@ -91,6 +103,8 @@ class EventRecoveryService:
             return self._snapshot_required(current_sequence)
         if after_sequence == current_sequence:
             session = await self._store.get_session(session_id, user_id=user_id)
+            runtime_state = await self._runtime_state(session, user_id=user_id)
+            session = session_with_runtime_state(session, runtime_state)
             session, _runtime_capabilities, effective_capabilities = (
                 await project_session_capabilities(
                     self._store,
@@ -106,6 +120,12 @@ class EventRecoveryService:
                         sequence=current_sequence,
                         event_type="session.meta.updated",
                         payload={"session": session.model_dump(mode="json")},
+                    ),
+                    protocol_event(
+                        session_id,
+                        sequence=current_sequence,
+                        event_type="runtime.state.updated",
+                        payload={"state": runtime_state.model_dump(mode="json")},
                     ),
                     protocol_event(
                         session_id,
@@ -133,6 +153,8 @@ class EventRecoveryService:
                     max(start_sequence, timeline_reset_sequence)
                 )
             session = await self._store.get_session(session_id, user_id=user_id)
+            runtime_state = await self._runtime_state(session, user_id=user_id)
+            session = session_with_runtime_state(session, runtime_state)
             session, _runtime_capabilities, effective_capabilities = (
                 await project_session_capabilities(
                     self._store,
@@ -177,12 +199,41 @@ class EventRecoveryService:
                     payload={"capabilitySet": effective_capabilities.model_dump(mode="json")},
                 )
             )
+        # Runtime state is published live only; a transition between the
+        # client's snapshot and its subscription would otherwise be lost.
+        if runtime_state.updatedSeq > after_sequence:
+            events.append(
+                protocol_event(
+                    session_id,
+                    sequence=runtime_state.updatedSeq,
+                    event_type="runtime.state.updated",
+                    payload={"state": runtime_state.model_dump(mode="json")},
+                )
+            )
         events.sort(key=lambda event: (event.sequence, event.eventId))
         return ProtocolEventRecoveryResponse(
             events=events,
             nextCursor=event_cursor(current_sequence),
             snapshotRequired=False,
             serverTime=utc_now(),
+        )
+
+    async def _runtime_state(
+        self,
+        session: SessionView,
+        *,
+        user_id: str,
+    ) -> SessionRuntimeState:
+        if self._runtime_state_cache is None:
+            return await self._store.get_session_runtime_state(
+                session.id,
+                user_id=user_id,
+            )
+        return await read_runtime_state_snapshot(
+            self._store,
+            self._runtime_state_cache,
+            session,
+            user_id,
         )
 
     @staticmethod
