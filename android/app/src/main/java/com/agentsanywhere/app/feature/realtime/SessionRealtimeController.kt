@@ -265,10 +265,10 @@ class SessionRealtimeController(
 /**
  * Orders one recovery page for the reducer and leaves its runtime state out.
  *
- * Every subscription re-reads runtime state through refreshRuntime(). A
- * recovered state can be older than a live one at the same version (a
- * selection change does not move updatedSeq), and the reducer's event-ID
- * dedupe would then block the correction.
+ * The first subscription and every reconnect re-read runtime state through
+ * refreshRuntime(). A recovered state can be older than a live one at the
+ * same version (a selection change does not move updatedSeq), and the
+ * reducer's event-ID dedupe would then block the correction.
  */
 internal fun recoveredEventsToApply(
     events: List<RemoteSessionEventEnvelope>,
