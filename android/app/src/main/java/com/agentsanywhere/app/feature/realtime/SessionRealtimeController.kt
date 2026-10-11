@@ -242,9 +242,7 @@ class SessionRealtimeController(
                 onSnapshotRequired("events.snapshotRequired")
                 return
             }
-            val events = response.events.sortedWith(
-                compareBy<RemoteSessionEventEnvelope> { it.sequence }.thenBy { it.eventId },
-            )
+            val events = recoveredEventsToApply(response.events)
             if (events.isNotEmpty()) onEvents(events)
             val next = response.nextCursor
             onCursorAdvanced(next)
@@ -263,6 +261,21 @@ class SessionRealtimeController(
         const val EVENT_BATCH_WINDOW_MILLIS = 34L
     }
 }
+
+/**
+ * Orders one recovery page for the reducer and leaves its runtime state out.
+ *
+ * The first subscription and every reconnect re-read runtime state through
+ * refreshRuntime(). A recovered state can be older than a live one at the
+ * same version (a selection change does not move updatedSeq), and the
+ * reducer's event-ID dedupe would then block the correction.
+ */
+internal fun recoveredEventsToApply(
+    events: List<RemoteSessionEventEnvelope>,
+): List<RemoteSessionEventEnvelope> =
+    events
+        .filterNot { it.type == "runtime.state.updated" }
+        .sortedWith(compareBy<RemoteSessionEventEnvelope> { it.sequence }.thenBy { it.eventId })
 
 private fun RemoteSessionEventEnvelope.isTimelineUpsert(): Boolean =
     type == "timeline.item_created" || type == "timeline.item_updated"

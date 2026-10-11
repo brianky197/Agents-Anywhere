@@ -106,6 +106,31 @@ class CatalogRepository(Protocol):
     ) -> CatalogUpdateOutcome: ...
 
 
+class SessionRuntimeStateRepository(Protocol):
+    async def get_session_runtime_state(
+        self,
+        session_id: str,
+        *,
+        user_id: str | None = None,
+    ) -> SessionRuntimeState: ...
+
+
+class SessionRuntimeStateWriter(Protocol):
+    def session_revision_fence(
+        self,
+        session_id: str,
+    ) -> AbstractAsyncContextManager[None]: ...
+
+    async def set_session_status(
+        self,
+        session_id: str,
+        status: SessionStatus,
+        *,
+        expected_status: SessionStatus | None = None,
+        mark_read_on_change: bool = False,
+    ) -> SessionView: ...
+
+
 class SessionStateRepository(SessionLookupRepository, Protocol):
     async def get_active_run(self, session_id: str) -> dict[str, Any] | None: ...
 

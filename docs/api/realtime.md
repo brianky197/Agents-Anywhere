@@ -91,9 +91,31 @@ Use `runtime.state.updated`, `runtime.capability.updated`,
 - Server returns `snapshotRequired=true` only when durable meta/timeline
   recovery is explicitly impossible.
 - Client pulls snapshot only for initial load or `snapshotRequired=true`.
-- Runtime state and catalogs are not recovered from Server DB. After reconnect,
-  Web calls the relevant runtime live endpoint if it needs current state or
-  catalogs.
+- Every successful recovery returns the newest runtime state Server holds (the
+  shared runtime state cache, else the persisted session status) as one
+  `runtime.state.updated` at the recovered cursor (`nextCursor`). Runtime
+  state is only pushed live, so a transition between the snapshot and the
+  WebSocket subscription is otherwise lost and the client keeps showing a
+  finished turn as running. The state's own version need not follow the
+  cursor, so the payload keeps its `updatedSeq` and clients must ignore a
+  state whose `updatedSeq` is older than the one they hold (an operation
+  response can hand them a newer state without moving the cursor).
+  `session.meta.updated` from recovery carries the same status.
+- A state change that keeps the status (for example a selection change) keeps
+  its `updatedSeq`, so version alone cannot order a recovered state against a
+  live one. Clients apply live events that arrive while a recovery request is
+  in flight after its response: Web and Desktop queue them, and iOS handles
+  the socket sequentially while it reconciles. Android instead leaves the
+  recovered runtime state out and re-reads it from the runtime state endpoint
+  (on the first `session.subscribed`, and on each later reconnect once the
+  WebSocket handshake succeeds), because its reducer deduplicates event IDs
+  and would otherwise refuse the live state that corrects a late recovery.
+- Server reads the snapshot cursor and its runtime state under one session
+  revision fence, and persists a runtime-read status together with the shared
+  cache under that fence, so recovery never pairs a new status with an old
+  cached state.
+- Catalogs are not recovered from Server DB. After reconnect, Web calls the
+  relevant runtime live endpoint if it needs current catalogs.
 - Runtime notices are recovered when Server has a sequence-backed projection.
   Session meta and the latest persisted effective capability projection are
   also returned when recovery starts at the current cursor, because presence

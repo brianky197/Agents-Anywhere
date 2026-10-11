@@ -47,6 +47,24 @@ import Testing
         #expect(projection.data.cursor == "seq:10")
     }
 
+    @Test func recoveredRuntimeStateNeverReplacesANewerOne() throws {
+        var projection = V2SessionProjection(snapshot: try snapshot(), maximumItems: 100)
+        var raw = try fixtureObject("state")["state"] as! [String: Any]
+        raw["sessionId"] = "session"
+        // An operation response applies a newer state without moving the cursor.
+        raw["status"] = "idle"; raw["updatedSeq"] = 20
+        projection.applyState(try decode(raw))
+        // A recovery response that left Server earlier arrives afterwards.
+        raw["status"] = "running"; raw["updatedSeq"] = 15
+        try projection.apply(event("runtime.state.updated", seq: 18, payload: ["state": raw]))
+        #expect(projection.data.state?.status == .idle)
+        #expect(projection.data.state?.updatedSeq == 20)
+        // A newer version still wins.
+        raw["status"] = "waiting"; raw["updatedSeq"] = 21
+        try projection.apply(event("runtime.state.updated", seq: 21, payload: ["state": raw]))
+        #expect(projection.data.state?.status == .waiting)
+    }
+
     @Test func timelineUsesRevisionAndHistoryDoesNotAcknowledgeEvents() throws {
         var projection = V2SessionProjection(snapshot: try snapshot(hasMore: true), maximumItems: 3)
         let newer = try itemObject(revision: 3, seq: 11, text: "Streamed")

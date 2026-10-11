@@ -9737,6 +9737,7 @@ def test_session_events_recovery_returns_live_projection_at_current_cursor(tmp_p
     assert recovery["nextCursor"] == snapshot["eventCursor"]
     assert {event["type"] for event in recovery["events"]} == {
         "session.meta.updated",
+        "runtime.state.updated",
         "runtime.capability.updated",
     }
     session_event = next(
@@ -9744,6 +9745,15 @@ def test_session_events_recovery_returns_live_projection_at_current_cursor(tmp_p
     )
     assert session_event["cursor"] == snapshot["eventCursor"]
     assert session_event["payload"]["session"]["connectorStatus"] == "online"
+    state_event = next(
+        event for event in recovery["events"] if event["type"] == "runtime.state.updated"
+    )
+    assert state_event["cursor"] == snapshot["eventCursor"]
+    assert state_event["payload"]["state"]["sessionId"] == session_id
+    assert (
+        state_event["payload"]["state"]["status"]
+        == session_event["payload"]["session"]["status"]
+    )
     capability_event = next(
         event
         for event in recovery["events"]

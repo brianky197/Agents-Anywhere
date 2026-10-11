@@ -44,6 +44,7 @@ def get_event_recovery_service(conn: HTTPConnection) -> EventRecoveryService:
         conn.app.state.store,
         conn.app.state.rpc,
         conn.app.state.timeline_write_buffer,
+        runtime_state_cache=conn.app.state.session_runtime_state_cache,
     )
 
 
