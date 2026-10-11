@@ -98,6 +98,16 @@ class RuntimeSyncRunner:
                 if runtime.sync_mode == "events":
                     await runtime.resynchronize()
                 await runtime.on_backend_reconnect()
+            except RuntimeUnavailableError as exc:
+                # A stopped instance has nothing to recover until it starts
+                # again. Other lifecycle states already reach Server through the
+                # status sink, so a traceback adds nothing.
+                if not self.runtime_stopped(runtime_id):
+                    logger.info(
+                        "runtime event recovery deferred runtime={} reason={}",
+                        runtime_id,
+                        exc,
+                    )
             except Exception:  # noqa: BLE001 - recover other runtimes independently
                 logger.exception("runtime event recovery deferred runtime={}", runtime_id)
 
@@ -232,7 +242,9 @@ class RuntimeSyncRunner:
                     (time.monotonic() - runtime_started_at) * 1000,
                 )
             except RuntimeUnavailableError:
-                if self.runtime_has_config(runtime_id):
+                if self.runtime_has_config(runtime_id) and not self.runtime_stopped(
+                    runtime_id
+                ):
                     logger.info(
                         "existing session sync runtime unavailable runtime={}",
                         runtime_id,
@@ -492,6 +504,16 @@ class RuntimeSyncRunner:
     def runtime_has_config(self, runtime_id: str) -> bool:
         entry = self.supervisor.entry(runtime_id)
         return entry.config is not None
+
+    def runtime_stopped(self, runtime_id: str) -> bool:
+        """Whether an instance was stopped on purpose and has nothing to sync.
+
+        Server stops an instance before retiring it, and the supervisor keeps
+        stopped entries for config reads and restarts. Neither the polling sync
+        nor reconnect recovery has work for them until they start again.
+        """
+        entry = self.supervisor.entry(runtime_id)
+        return entry.status == "stopped" and entry.runtime is None
 
 
 def validation_error_summary(error: ValidationError) -> str:
