@@ -112,6 +112,7 @@ from agent_server.services.effective_capabilities import (
 )
 from agent_server.services.event_recovery import EventRecoveryService
 from agent_server.services.session_meta_projection import (
+    persist_runtime_state,
     project_session_meta_for_dashboard,
     read_runtime_state_snapshot,
     session_with_runtime_state,
@@ -297,9 +298,7 @@ async def refresh_runtime_state_in_background(
             state = await read_runtime_state_from_connector(manager, session)
             if state is None:
                 return
-            persisted_session = await db.set_session_status(session.id, state.status)
-            state = state.model_copy(update={"updatedSeq": persisted_session.updatedSeq})
-            await runtime_state_cache.put(state)
+            state = await persist_runtime_state(db, runtime_state_cache, state)
             if runtime_state_semantically_equal(previous_state, state):
                 return
             await _publish_session_runtime_state_update(
@@ -946,6 +945,14 @@ async def session_snapshot(
                 limit=limit,
             )
             next_seq = await db.get_session_seq(session_id)
+            # A state transition may have landed since the first read. Pair the
+            # cursor with the state as of the same revision, as publish does.
+            runtime_state = await read_runtime_state_snapshot(
+                db,
+                runtime_state_cache,
+                session,
+                user_id,
+            )
         session = session_with_runtime_state(session, runtime_state)
         session = await with_effective_session_connector_status(manager, session)
         effective_capabilities = derive_session_effective_capabilities(
@@ -1622,10 +1629,7 @@ async def read_runtime_state_live(
     if await manager.is_online(session.connectorId):
         state = await read_runtime_state_from_connector(manager, session)
         if state is not None:
-            persisted_session = await db.set_session_status(session.id, state.status)
-            state = state.model_copy(update={"updatedSeq": persisted_session.updatedSeq})
-            await runtime_state_cache.put(state)
-            return state
+            return await persist_runtime_state(db, runtime_state_cache, state)
     cached_state = await runtime_state_cache.get(session.id)
     if cached_state is not None:
         return cached_state

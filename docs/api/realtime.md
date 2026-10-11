@@ -91,14 +91,20 @@ Use `runtime.state.updated`, `runtime.capability.updated`,
 - Server returns `snapshotRequired=true` only when durable meta/timeline
   recovery is explicitly impossible.
 - Client pulls snapshot only for initial load or `snapshotRequired=true`.
-- Recovery returns the newest runtime state Server holds (the shared runtime
-  state cache, else the persisted session status) as `runtime.state.updated`:
-  at the current cursor always, otherwise when its `updatedSeq` is newer than
-  `after`. Runtime state is only pushed live, so a transition between the
-  snapshot and the WebSocket subscription is otherwise lost and the client
-  keeps showing a finished turn as running. `session.meta.updated` from
-  recovery carries the same status. Clients keep accepting a state only when
-  its `updatedSeq` is not older than the one they hold.
+- Every successful recovery returns the newest runtime state Server holds (the
+  shared runtime state cache, else the persisted session status) as one
+  `runtime.state.updated` at the recovered cursor (`nextCursor`). Runtime
+  state is only pushed live, so a transition between the snapshot and the
+  WebSocket subscription is otherwise lost and the client keeps showing a
+  finished turn as running. The state's own version need not follow the
+  cursor, so the payload keeps its `updatedSeq` and clients must ignore a
+  state whose `updatedSeq` is older than the one they hold (an operation
+  response can hand them a newer state without moving the cursor).
+  `session.meta.updated` from recovery carries the same status.
+- Server reads the snapshot cursor and its runtime state under one session
+  revision fence, and persists a runtime-read status together with the shared
+  cache under that fence, so recovery never pairs a new status with an old
+  cached state.
 - Catalogs are not recovered from Server DB. After reconnect, Web calls the
   relevant runtime live endpoint if it needs current catalogs.
 - Runtime notices are recovered when Server has a sequence-backed projection.

@@ -200,16 +200,18 @@ class EventRecoveryService:
                 )
             )
         # Runtime state is published live only; a transition between the
-        # client's snapshot and its subscription would otherwise be lost.
-        if runtime_state.updatedSeq > after_sequence:
-            events.append(
-                protocol_event(
-                    session_id,
-                    sequence=runtime_state.updatedSeq,
-                    event_type="runtime.state.updated",
-                    payload={"state": runtime_state.model_dump(mode="json")},
-                )
+        # client's snapshot and its subscription would otherwise be lost. Its
+        # version need not follow the cursor (a snapshot reads the state before
+        # its cursor), so always return it at the recovered cursor and let the
+        # client keep whichever payload updatedSeq is newer.
+        events.append(
+            protocol_event(
+                session_id,
+                sequence=current_sequence,
+                event_type="runtime.state.updated",
+                payload={"state": runtime_state.model_dump(mode="json")},
             )
+        )
         events.sort(key=lambda event: (event.sequence, event.eventId))
         return ProtocolEventRecoveryResponse(
             events=events,

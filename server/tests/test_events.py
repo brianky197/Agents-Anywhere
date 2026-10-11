@@ -16,9 +16,13 @@ from agent_server.core.events import (
 from agent_server.core.models import SessionRuntimeState, SessionStatus, TimelineItemIn
 from agent_server.infra.connector_rpc import ConnectorRpcManager
 from agent_server.infra.db.migrations import upgrade_database
+from agent_server.infra.redis_coordinator import RedisCoordinator
 from agent_server.infra.repositories.facade import Store
+from agent_server.infra.timeline_broker import TimelineBroker
 from agent_server.services.event_recovery import EventRecoveryService
+from agent_server.services.session_meta_projection import persist_runtime_state
 from agent_server.services.session_runtime_state_cache import SessionRuntimeStateCache
+from agent_server.services.timeline_write_buffer import TimelineWriteBuffer
 from session_fixtures import create_session_with_project
 
 
@@ -349,7 +353,7 @@ def test_recovery_returns_runtime_state_changed_before_subscription(
                 event for event in recovery.events if event.type == "runtime.state.updated"
             ]
             assert len(states) == 1
-            assert states[0].sequence == idle.updatedSeq
+            assert states[0].sequence == parse_event_cursor(recovery.nextCursor)
             assert states[0].payload["state"]["status"] == "idle"
             assert states[0].payload["state"]["updatedSeq"] == idle.updatedSeq
             metas = [
@@ -397,6 +401,144 @@ def test_recovery_at_current_cursor_returns_cached_runtime_state(tmp_path) -> No
             assert [event.payload["state"]["status"] for event in states] == ["idle"]
             assert states[0].sequence == current
         finally:
+            await presence.close()
+            await store.close()
+
+    asyncio.run(exercise())
+
+
+def test_recovery_returns_runtime_state_older_than_the_cursor(tmp_path) -> None:
+    """A snapshot reads the state before its cursor, so the cursor can pass it."""
+
+    async def exercise() -> None:
+        path = tmp_path / "events.sqlite3"
+        upgrade_database(sqlite_path=path)
+        store = Store(path)
+        presence = ConnectorRpcManager()
+        cache = SessionRuntimeStateCache()
+        try:
+            connector, _token, _prefix = await store.create_connector(
+                name="dev",
+                user_id="user-1",
+            )
+            session = await create_session_with_project(
+                store,
+                connector_id=connector.id,
+                user_id="user-1",
+                external_session_id="thread-1",
+                title="Recovery",
+            )
+            await _put_runtime_status(store, cache, session.id, "running")
+            idle = await _put_runtime_status(store, cache, session.id, "idle")
+            # The snapshot's cursor already covers the idle revision although
+            # its state was read while the turn was still running.
+            snapshot_cursor = event_cursor(idle.updatedSeq)
+            await store.upsert_timeline_item(
+                session_id=session.id,
+                item=_timeline_item(session.id, "item-1", 1),
+            )
+            assert await store.get_session_seq(session.id) > idle.updatedSeq
+
+            recovery = await EventRecoveryService(
+                store,
+                presence,
+                runtime_state_cache=cache,
+            ).recover(session.id, after=snapshot_cursor, user_id="user-1")
+
+            states = [
+                event for event in recovery.events if event.type == "runtime.state.updated"
+            ]
+            assert len(states) == 1
+            assert states[0].sequence == parse_event_cursor(recovery.nextCursor)
+            assert states[0].payload["state"]["status"] == "idle"
+            assert states[0].payload["state"]["updatedSeq"] == idle.updatedSeq
+        finally:
+            await presence.close()
+            await store.close()
+
+    asyncio.run(exercise())
+
+
+def test_recovery_cannot_pair_a_persisted_status_with_an_older_cached_state(
+    tmp_path,
+) -> None:
+    async def exercise() -> None:
+        path = tmp_path / "events.sqlite3"
+        upgrade_database(sqlite_path=path)
+        store = Store(path)
+        presence = ConnectorRpcManager()
+        coordinator = RedisCoordinator()
+        buffer = TimelineWriteBuffer(store, TimelineBroker(coordinator), coordinator)
+        put_started = asyncio.Event()
+        release_put = asyncio.Event()
+
+        class SlowCache(SessionRuntimeStateCache):
+            blocking = False
+
+            async def put(self, state: SessionRuntimeState) -> None:
+                if self.blocking:
+                    put_started.set()
+                    await release_put.wait()
+                await super().put(state)
+
+        cache = SlowCache()
+        try:
+            connector, _token, _prefix = await store.create_connector(
+                name="dev",
+                user_id="user-1",
+            )
+            session = await create_session_with_project(
+                store,
+                connector_id=connector.id,
+                user_id="user-1",
+                external_session_id="thread-1",
+                title="Recovery",
+            )
+            running = await persist_runtime_state(
+                store,
+                cache,
+                (await store.get_session_runtime_state(session.id)).model_copy(
+                    update={"status": "running"}
+                ),
+            )
+            snapshot_cursor = event_cursor(await store.get_session_seq(session.id))
+
+            # A background runtime refresh persists idle and is about to share
+            # it when recovery arrives.
+            cache.blocking = True
+            refresh = asyncio.create_task(
+                persist_runtime_state(
+                    store,
+                    cache,
+                    running.model_copy(update={"status": "idle"}),
+                )
+            )
+            await put_started.wait()
+            recovery_task = asyncio.create_task(
+                EventRecoveryService(
+                    store,
+                    presence,
+                    buffer,
+                    runtime_state_cache=cache,
+                ).recover(session.id, after=snapshot_cursor, user_id="user-1")
+            )
+            await asyncio.sleep(0.05)
+            assert not recovery_task.done()
+            release_put.set()
+            idle = await refresh
+            recovery = await recovery_task
+
+            states = [
+                event for event in recovery.events if event.type == "runtime.state.updated"
+            ]
+            assert [event.payload["state"]["status"] for event in states] == ["idle"]
+            assert states[0].payload["state"]["updatedSeq"] == idle.updatedSeq
+            metas = [
+                event for event in recovery.events if event.type == "session.meta.updated"
+            ]
+            assert [event.payload["session"]["status"] for event in metas] == ["idle"]
+        finally:
+            await buffer.close()
             await presence.close()
             await store.close()
 
