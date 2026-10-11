@@ -58,6 +58,10 @@ struct V2SessionProjection {
     mutating func applyState(_ state: V2RuntimeState) {
         guard state.sessionId == data.session.id,
               (state.runtimeId ?? state.runtime) == data.session.effectiveRuntimeId else { return }
+        // Recovery returns the latest state at the recovered cursor, while an
+        // operation response can already have applied a newer one without
+        // moving the cursor. Equal versions still apply live transitions.
+        if let current = data.state, state.updatedSeq < current.updatedSeq { return }
         data.state = state
     }
 
