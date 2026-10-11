@@ -46,14 +46,15 @@ if (!explicitWebUrl) {
 try {
   await waitForUrl(devUrl);
   await uvBundle;
-  const electronProcess = spawn(path.join(root, "node_modules", ".bin", process.platform === "win32" ? "electron.cmd" : "electron"), ["."], {
+  // Run Electron's launcher with this Node directly: the `.bin/electron.cmd` shim needs a
+  // shell on Windows, which would split a checkout path that contains spaces.
+  const electronProcess = spawn(process.execPath, [path.join(root, "node_modules", "electron", "cli.js"), "."], {
     cwd: root,
     stdio: "inherit",
     env: {
       ...process.env,
       WORKBENCH_WEB_URL: devUrl,
     },
-    shell: usesShell,
   });
 
   const shutdown = () => {
