@@ -3485,6 +3485,93 @@ def test_reconnect_recovers_an_unchanged_polling_session_once():
     asyncio.run(run())
 
 
+def _capture_logs() -> tuple[list[dict[str, Any]], int]:
+    from connector.logging import logger
+
+    records: list[dict[str, Any]] = []
+    sink_id = logger.add(lambda message: records.append(message.record), level="DEBUG")
+    return records, sink_id
+
+
+def test_stopped_runtime_instance_is_left_alone_by_sync_and_reconnect():
+    """Server stops an instance before retiring it; nothing should keep touching it."""
+    from unittest.mock import AsyncMock
+
+    from connector.logging import logger
+    from connector.runtime_protocol import RuntimeInstanceSpec, RuntimeSupervisor
+
+    async def run():
+        runtime = FakeAgentRuntime()
+        supervisor = RuntimeSupervisor((FakeAgentProvider(runtime),), RecordingRuntimeHost())
+        await supervisor.start(
+            RuntimeInstanceSpec(runtime_id="rti_retired", runtime_type="codex", name="Old"),
+            {},
+        )
+        await supervisor.stop("rti_retired")
+        assert supervisor.entry("rti_retired").config is not None
+        ingest = AsyncMock()
+        runner = RuntimeSyncRunner(
+            config=_client().config, supervisor=supervisor,
+            host=RecordingRuntimeHost(), preferences_reader=dict,
+            send_notification=unused_notification_sender, ingest_notifications=ingest,
+        )
+        records, sink_id = _capture_logs()
+        try:
+            await runner.reconnect_event_runtimes()
+            await runner.sync_existing_once()
+            await runner.sync_existing_once()
+        finally:
+            logger.remove(sink_id)
+        assert not [record for record in records if "rti_retired" in record["message"]]
+        assert not [record for record in records if record["level"].no >= 30]
+        ingest.assert_not_awaited()
+
+    asyncio.run(run())
+
+
+def test_reconnect_reports_an_unavailable_runtime_without_a_traceback():
+    from unittest.mock import AsyncMock
+
+    from connector.logging import logger
+    from connector.runtime_protocol import RuntimeInstanceSpec, RuntimeSupervisor
+
+    class BrokenProvider(FakeAgentProvider):
+        async def create_runtime(self, config, host):  # type: ignore[no-untyped-def]
+            raise RuntimeError("runtime binary missing")
+
+    async def run():
+        supervisor = RuntimeSupervisor(
+            (BrokenProvider(FakeAgentRuntime()),),
+            RecordingRuntimeHost(),
+        )
+        with pytest.raises(RuntimeError):
+            await supervisor.start(
+                RuntimeInstanceSpec(runtime_id="rti_broken", runtime_type="codex", name="Broken"),
+                {},
+            )
+        assert supervisor.entry("rti_broken").status == "error"
+        runner = RuntimeSyncRunner(
+            config=_client().config, supervisor=supervisor,
+            host=RecordingRuntimeHost(), preferences_reader=dict,
+            send_notification=unused_notification_sender, ingest_notifications=AsyncMock(),
+        )
+        records, sink_id = _capture_logs()
+        try:
+            await runner.reconnect_event_runtimes()
+        finally:
+            logger.remove(sink_id)
+        deferred = [
+            record for record in records
+            if record["message"].startswith("runtime event recovery deferred runtime=rti_broken")
+        ]
+        assert len(deferred) == 1
+        assert deferred[0]["level"].name == "INFO"
+        assert deferred[0]["exception"] is None
+        assert "status='error'" in deferred[0]["message"]
+
+    asyncio.run(run())
+
+
 def test_failed_session_does_not_repeat_successful_recovery_but_changes_still_sync():
     from collections import Counter
     from unittest.mock import AsyncMock
