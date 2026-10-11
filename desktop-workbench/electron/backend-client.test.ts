@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import type { ChildProcess } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -57,6 +58,11 @@ async function waitFor(check: () => boolean, failure: string, timeoutMs = 5_000)
   assert.fail(failure);
 }
 
+/** The supervised process, so a test can see its IPC channel close before it exits. */
+function backendProcess(client: DesktopBackendClient): ChildProcess | null {
+  return (client as unknown as { child: ChildProcess | null }).child;
+}
+
 test("proxies a backend netFetch request that arrives after the ready handshake", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "aa-backend-client-"));
   const entryPath = path.join(root, "fixture-backend.js");
@@ -81,6 +87,40 @@ test("proxies a backend netFetch request that arrives after the ready handshake"
     assert.equal(calls[0].init?.method, "POST");
     assert.deepEqual(calls[0].init?.headers, { authorization: "Bearer user" });
     assert.equal(calls[0].init?.body, "{\"name\":\"Office Mac\"}");
+  } finally {
+    await client.shutdown();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a backend whose channel closed before it exited is neither answered nor told to shut down", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "aa-backend-client-disconnected-"));
+  const entryPath = path.join(root, "fixture-backend.js");
+  // The channel closes well before the process exits, which is the window an exiting
+  // backend leaves open, much wider on Windows than elsewhere.
+  fs.writeFileSync(entryPath, `
+process.send({ type: "ready", port: 1, token: "fixture-token" });
+process.send({ type: "netFetch", id: 9, url: "https://server.example/api/v2/me", method: "GET", headers: {} }, () => {
+  process.disconnect();
+  setTimeout(() => process.exit(0), 1_000);
+});
+`, "utf8");
+  let answered = false;
+  const client = new DesktopBackendClient({
+    entryPath,
+    fetcher: async (url) => {
+      if (url.endsWith("/events")) return new Response("", { status: 200 });
+      await waitFor(() => backendProcess(client)?.connected === false, "The backend never closed its channel.");
+      answered = true;
+      return new Response("{}", { status: 200, headers: { "content-type": "application/json" } });
+    },
+  });
+  try {
+    await client.start(initFor(root));
+    await waitFor(() => answered, "The backend's netFetch request never reached the fetcher.");
+    assert.ok(backendProcess(client), "the backend has not exited yet");
+    await client.shutdown();
+    assert.equal(client.running, false);
   } finally {
     await client.shutdown();
     fs.rmSync(root, { recursive: true, force: true });
