@@ -101,6 +101,14 @@ Use `runtime.state.updated`, `runtime.capability.updated`,
   state whose `updatedSeq` is older than the one they hold (an operation
   response can hand them a newer state without moving the cursor).
   `session.meta.updated` from recovery carries the same status.
+- A state change that keeps the status (for example a selection change) keeps
+  its `updatedSeq`, so version alone cannot order a recovered state against a
+  live one. Clients apply live events that arrive while a recovery request is
+  in flight after its response: Web and Desktop queue them, and iOS handles
+  the socket sequentially while it reconciles. Android instead leaves the
+  recovered runtime state out and re-reads it from the runtime state endpoint
+  after every subscription, because its reducer deduplicates event IDs and
+  would otherwise refuse the live state that corrects a late recovery.
 - Server reads the snapshot cursor and its runtime state under one session
   revision fence, and persists a runtime-read status together with the shared
   cache under that fence, so recovery never pairs a new status with an old
