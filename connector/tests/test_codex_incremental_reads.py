@@ -199,13 +199,17 @@ def test_windows_rollout_open_in_codex_is_owned_without_walking_processes(
             return await runtime.get_session_state(session.session_id, external_session_id="thread_1")
 
         this_process = codex_history_index.psutil.Process().name()
-        with client.path.open("ab"):
+        rollout = client.path.open("ab")
+        try:
             # Another program holding the rollout is not Codex running the thread.
             held_elsewhere = await state()
             with monkeypatch.context() as patch:
                 patch.setattr(codex_history_index, "_is_codex_process", lambda info: info.get("name") == this_process)
                 owned = await state()
-        released = await state()
+                rollout.close()
+                released = await state()
+        finally:
+            rollout.close()
 
         assert owned is not None and owned.status == "running"
         assert owned.metadata["native_activity_evidence"] == "owner"
@@ -217,30 +221,78 @@ def test_windows_rollout_open_in_codex_is_owned_without_walking_processes(
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows file-system ownership query")
-def test_windows_ownership_query_never_contends_for_the_rollout(tmp_path):
+def test_windows_unanswered_ownership_query_claims_no_activity(tmp_path, monkeypatch):
+    client = NativeHistory(tmp_path / "native", count=2)
+    client.turns[-1]["status"] = "inProgress"
+    client.persist()
+    os.utime(client.path, (1, 1))
+    assert codex_history_index.read_native_thread_activity(client.ref).evidence == "stale"
+
+    create_file, close_handle, _query = codex_history_index._windows_file_api()
+    not_supported = 0xC00000BB
+    monkeypatch.setattr(
+        codex_history_index,
+        "_windows_file_api",
+        lambda: (create_file, close_handle, lambda *_args: not_supported),
+    )
+
+    # A file system that cannot say who holds the rollout must not turn a
+    # possibly live turn into a stale one.
+    assert codex_history_index._windows_processes_using_file(str(client.path)) is None
+    assert codex_history_index.read_native_thread_activity(client.ref) is None
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows file-system ownership query")
+def test_windows_ownership_query_never_contends_for_the_rollout(tmp_path, monkeypatch):
     rollout = tmp_path / "rollout.jsonl"
     rollout.write_text("{}\n")
     using = codex_history_index._windows_processes_using_file
-
-    assert using(str(rollout)) == []
-    assert using(str(tmp_path / "missing.jsonl")) == []
-    with rollout.open("rb"):
-        assert using(str(rollout)) == [os.getpid()]
-
-    # A holder that shares nothing still shows up: the query's handle reads
-    # attributes only, so it neither conflicts with nor blocks the holder.
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     kernel32.CreateFileW.restype = ctypes.c_void_p
     kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
-    exclusive = kernel32.CreateFileW(str(rollout), 0x40000000, 0, None, 3, 0, None)
-    assert exclusive not in (None, ctypes.c_void_p(-1).value)
+    invalid = (None, ctypes.c_void_p(-1).value)
+
+    def open_exclusively():
+        return kernel32.CreateFileW(str(rollout), 0x40000000, 0, None, 3, 0, None)
+
+    assert os.getpid() not in using(str(rollout))
+    assert using(str(tmp_path / "missing.jsonl")) is None
+    with rollout.open("rb"):
+        assert os.getpid() in using(str(rollout))
+
+    # A holder that shares nothing still shows up.
+    exclusive = open_exclusively()
+    assert exclusive not in invalid
     try:
         with pytest.raises(PermissionError):
             rollout.open("rb")
-        assert using(str(rollout)) == [os.getpid()]
+        assert os.getpid() in using(str(rollout))
     finally:
         kernel32.CloseHandle(exclusive)
-    assert using(str(rollout)) == []
+    assert os.getpid() not in using(str(rollout))
+
+    # While the query's own handle is open, Codex can still open the rollout
+    # exclusively, and the file can still be renamed.
+    create_file, close_handle, query = codex_history_index._windows_file_api()
+    others = []
+
+    def query_while_others_use_the_rollout(*args):
+        writer = open_exclusively()
+        others.append(writer not in invalid)
+        if writer not in invalid:
+            kernel32.CloseHandle(writer)
+        moved = rollout.with_name("moved.jsonl")
+        os.replace(rollout, moved)
+        os.replace(moved, rollout)
+        return query(*args)
+
+    monkeypatch.setattr(
+        codex_history_index,
+        "_windows_file_api",
+        lambda: (create_file, close_handle, query_while_others_use_the_rollout),
+    )
+    assert using(str(rollout)) is not None
+    assert others == [True]
 
 
 @pytest.mark.parametrize("mutation", ["old_edit", "old_tool_edit", "delete_turn", "delete_item", "reorder", "unfinished", "invalid_checkpoint"])
