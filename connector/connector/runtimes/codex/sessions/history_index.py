@@ -5,9 +5,11 @@ before omitting old pages. Unknown schemas/lineages always use the RPC full read
 """
 from __future__ import annotations
 
+import ctypes
 import hashlib
 import json
 import sqlite3
+import sys
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -110,11 +112,46 @@ def _source_is_recent(source: Mapping[str, Any]) -> bool:
 
 
 def _source_is_open_by_codex(source: Mapping[str, Any]) -> bool:
+    if sys.platform == "win32":
+        path = source.get("path")
+        return isinstance(path, str) and _windows_file_has_writer(path)
     device = source.get("device")
     inode = source.get("inode")
     if not isinstance(device, int) or not isinstance(inode, int):
         return False
     return (device, inode) in _open_codex_file_identities(int(time.monotonic()))
+
+
+_GENERIC_READ = 0x80000000
+_FILE_SHARE_READ_DELETE = 0x1 | 0x4
+_OPEN_EXISTING = 3
+_ERROR_SHARING_VIOLATION = 32
+
+
+def _windows_file_has_writer(path: str) -> bool:
+    """Whether some handle holds ``path`` open for writing.
+
+    Codex keeps a rollout open for writing for as long as it runs the thread,
+    including while a tool call leaves the file untouched. Asking Codex processes
+    for their open files instead walks every handle in the system and, on a busy
+    machine, held the GIL for over 20 seconds, so the Connector missed its
+    keepalive and the Server's requests timed out. Opening the file without
+    FILE_SHARE_WRITE answers at once: it fails while any handle can write to it.
+    """
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = [
+        ctypes.c_wchar_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p,
+        ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p,
+    ]
+    create_file.restype = ctypes.c_void_p
+    handle = create_file(path, _GENERIC_READ, _FILE_SHARE_READ_DELETE, None, _OPEN_EXISTING, 0, None)
+    if handle is None or handle == ctypes.c_void_p(-1).value:
+        return ctypes.get_last_error() == _ERROR_SHARING_VIOLATION
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel32.CloseHandle(handle)
+    return False
 
 
 @lru_cache(maxsize=2)

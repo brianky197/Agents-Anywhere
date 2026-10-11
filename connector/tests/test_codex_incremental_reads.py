@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import sqlite3
+import sys
 from dataclasses import asdict
 from unittest.mock import AsyncMock
 
@@ -174,6 +175,54 @@ def test_stale_unowned_native_in_progress_turn_is_exposed_as_idle(tmp_path):
         assert state.metadata["native_status"] == "inProgress"
 
     asyncio.run(run())
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows share-mode ownership check")
+def test_windows_rollout_held_for_writing_is_owned_without_walking_processes(
+    tmp_path,
+    monkeypatch,
+):
+    def walk_processes(*_args, **_kwargs):
+        raise AssertionError("walking every process's handles stalled the Connector on Windows")
+
+    async def run():
+        client = NativeHistory(tmp_path / "native", count=2)
+        client.turns[-1]["status"] = "inProgress"
+        client.persist()
+        os.utime(client.path, (1, 1))
+        monkeypatch.setattr(codex_history_index.psutil, "process_iter", walk_processes)
+        runtime, _, _ = boot(tmp_path / "checkpoint.json", client)
+        session = (await runtime.list_sessions())[0]
+
+        async def state():
+            return await runtime.get_session_state(session.session_id, external_session_id="thread_1")
+
+        # Codex keeps its rollout open for writing while it runs a turn.
+        with client.path.open("ab"):
+            owned = await state()
+        released = await state()
+
+        assert owned is not None and owned.status == "running"
+        assert owned.metadata["native_activity_evidence"] == "owner"
+        assert released is not None and released.status == "idle"
+        assert released.metadata["native_activity_evidence"] == "stale"
+
+    asyncio.run(run())
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows share-mode ownership check")
+def test_windows_ownership_check_sees_writers_only(tmp_path):
+    rollout = tmp_path / "rollout.jsonl"
+    rollout.write_text("{}\n")
+    has_writer = codex_history_index._windows_file_has_writer
+
+    assert has_writer(str(rollout)) is False
+    with rollout.open("rb"):
+        assert has_writer(str(rollout)) is False
+    with rollout.open("ab"):
+        assert has_writer(str(rollout)) is True
+    assert has_writer(str(rollout)) is False
+    assert has_writer(str(tmp_path / "missing.jsonl")) is False
 
 
 @pytest.mark.parametrize("mutation", ["old_edit", "old_tool_edit", "delete_turn", "delete_item", "reorder", "unfinished", "invalid_checkpoint"])
