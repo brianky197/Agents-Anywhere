@@ -5,13 +5,15 @@ before omitting old pages. Unknown schemas/lineages always use the RPC full read
 """
 from __future__ import annotations
 
+import ctypes
 import hashlib
 import json
 import sqlite3
+import sys
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
-from functools import lru_cache
+from functools import cache, lru_cache
 from pathlib import Path
 from typing import Any, Literal
 
@@ -66,7 +68,8 @@ def read_native_thread_activity(
             return None
         normalized_status = row[1].replace("_", "").lower()
         if normalized_status in {"inprogress", "running"}:
-            if _source_is_open_by_codex(source):
+            owned = _source_is_open_by_codex(source)
+            if owned:
                 status: Literal["idle", "running"] = "running"
                 evidence: Literal["terminal", "owner", "recent", "stale"] = (
                     "owner"
@@ -74,6 +77,10 @@ def read_native_thread_activity(
             elif _source_is_recent(source):
                 status = "running"
                 evidence = "recent"
+            elif owned is None:
+                # Whether Codex still holds the rollout is unknown, so the row
+                # proves neither a live turn nor a stale one.
+                return None
             else:
                 # Codex can leave an inProgress row behind when a desktop-owned
                 # task is unloaded without a terminal event. Once no Codex
@@ -109,12 +116,115 @@ def _source_is_recent(source: Mapping[str, Any]) -> bool:
     return age_ns <= _NATIVE_ACTIVITY_STARTUP_GRACE_SECONDS * 1_000_000_000
 
 
-def _source_is_open_by_codex(source: Mapping[str, Any]) -> bool:
+def _source_is_open_by_codex(source: Mapping[str, Any]) -> bool | None:
+    """Whether a Codex process has the rollout open; None when that is unknown."""
+
+    if sys.platform == "win32":
+        path = source.get("path")
+        if not isinstance(path, str):
+            return None
+        pids = _windows_processes_using_file(path)
+        if pids is None:
+            return None
+        return any(_is_codex_pid(pid) for pid in pids)
     device = source.get("device")
     inode = source.get("inode")
     if not isinstance(device, int) or not isinstance(inode, int):
         return False
     return (device, inode) in _open_codex_file_identities(int(time.monotonic()))
+
+
+def _is_codex_pid(pid: int) -> bool:
+    try:
+        process = psutil.Process(pid)
+        if _is_codex_process(process.as_dict(["name", "exe"])):
+            return True
+        # psutil reads a command line from the process's memory without
+        # releasing the GIL, so only a holder its name does not settle pays.
+        return _is_codex_process({"cmdline": process.cmdline()})
+    except psutil.Error:
+        return False
+
+
+_FILE_READ_ATTRIBUTES = 0x80
+_FILE_SHARE_ALL = 0x1 | 0x2 | 0x4
+_OPEN_EXISTING = 3
+_FILE_PROCESS_IDS_USING_FILE_INFORMATION = 47
+_STATUS_BUFFER_OVERFLOW = 0x80000005
+_STATUS_INFO_LENGTH_MISMATCH = 0xC0000004
+_STATUS_BUFFER_TOO_SMALL = 0xC0000023
+_PROCESS_IDS_BUFFER_LIMIT = 1 << 20
+
+
+class _IoStatusBlock(ctypes.Structure):
+    _fields_ = [("status", ctypes.c_void_p), ("information", ctypes.c_size_t)]
+
+
+class _ProcessIdsUsingFile(ctypes.Structure):
+    _fields_ = [("count", ctypes.c_uint32), ("pids", ctypes.c_size_t * 1)]
+
+
+def _windows_processes_using_file(path: str) -> list[int] | None:
+    """The ids of processes that have ``path`` open, or None when that is unknown.
+
+    psutil finds a process's open files by walking the system handle table and
+    asking for each handle's name while holding the GIL; on a busy machine one
+    pass took 21 s and froze the event loop past the Server's websocket
+    keepalive. This asks the file system who has this one file open
+    (FileProcessIdsUsingFileInformation) instead. The handle opened for the
+    query reads attributes only with full sharing, so it takes no part in
+    sharing checks and cannot deny Codex access to its rollout. ctypes releases
+    the GIL during each native call; one query measured about 0.1 s, but file
+    systems and filter drivers give no hard bound. A file system that cannot
+    answer leaves the question unknown rather than answering "nobody".
+    """
+
+    create_file, close_handle, query_information_file = _windows_file_api()
+    handle = create_file(path, _FILE_READ_ATTRIBUTES, _FILE_SHARE_ALL, None, _OPEN_EXISTING, 0, None)
+    if handle is None or handle == ctypes.c_void_p(-1).value:
+        return None
+    try:
+        size = 4096
+        while size <= _PROCESS_IDS_BUFFER_LIMIT:
+            buffer = ctypes.create_string_buffer(size)
+            status = query_information_file(
+                handle,
+                ctypes.byref(_IoStatusBlock()),
+                buffer,
+                size,
+                _FILE_PROCESS_IDS_USING_FILE_INFORMATION,
+            )
+            if status in (_STATUS_INFO_LENGTH_MISMATCH, _STATUS_BUFFER_OVERFLOW, _STATUS_BUFFER_TOO_SMALL):
+                size *= 4
+                continue
+            if status != 0:
+                return None
+            count = _ProcessIdsUsingFile.from_buffer(buffer).count
+            pids = (ctypes.c_size_t * count).from_buffer(buffer, _ProcessIdsUsingFile.pids.offset)
+            return list(pids)
+        return None
+    finally:
+        close_handle(handle)
+
+
+@cache
+def _windows_file_api() -> tuple[Any, Any, Any]:
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = [
+        ctypes.c_wchar_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p,
+        ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p,
+    ]
+    create_file.restype = ctypes.c_void_p
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = [ctypes.c_void_p]
+    query_information_file = ctypes.WinDLL("ntdll").NtQueryInformationFile
+    query_information_file.argtypes = [
+        ctypes.c_void_p, ctypes.POINTER(_IoStatusBlock), ctypes.c_void_p,
+        ctypes.c_uint32, ctypes.c_int,
+    ]
+    query_information_file.restype = ctypes.c_uint32
+    return create_file, close_handle, query_information_file
 
 
 @lru_cache(maxsize=2)
